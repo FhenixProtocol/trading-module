@@ -186,10 +186,33 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * - the caller must have allowance for ``from``'s tokens of at least
      * `value`.
      */
-    function encTransferFrom(
+    function encTransferFromDirect(
         address from,
         address to,
         InEuint128 memory inValue,
+        FHERC20_EIP712_Permit calldata permit
+    ) external returns (euint128 transferred);
+
+    function encTransferFromDirectWithMax(
+        address from,
+        address to,
+        euint128 value,
+        InEuint128 memory inValue,
+        FHERC20_EIP712_Permit calldata permit
+    ) external returns (euint128 transferred);
+
+    function encTransferFrom(
+        address from,
+        address to,
+        euint128 value,
+        FHERC20_EIP712_Permit calldata permit
+    ) external returns (euint128 transferred);
+
+    function encTransferFromWithMax(
+        address from,
+        address to,
+        euint128 value,
+        euint128 maxValue,
         FHERC20_EIP712_Permit calldata permit
     ) external returns (euint128 transferred);
 

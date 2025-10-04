@@ -5,7 +5,7 @@ pragma solidity ^0.8.25;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import { euint128, InEuint128 } from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+import { euint64, InEuint64 } from "@fhenixprotocol/cofhe-contracts/FHE.sol";
 
 /**
  * @dev Implementation of the {IERC20} interface.
@@ -117,9 +117,9 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     /**
      * @dev See {IERC20-balanceOf}.
      *
-     * Returns the euint128 representing the account's true balance (encrypted)
+     * Returns the euint64 representing the account's true balance (encrypted)
      */
-    function encBalanceOf(address account) external view returns (euint128);
+    function encBalanceOf(address account) external view returns (euint64);
 
     /**
      * @dev See {IERC20-transfer}.
@@ -130,15 +130,15 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     /**
      * @dev See {IERC20-transfer}.
      *
-     * Intended to be used as a EOA call with an encrypted input `InEuint128 inValue`.
+     * Intended to be used as a EOA call with an encrypted input `InEuint64 inValue`.
      *
      * Requirements:
      *
      * - `to` cannot be the zero address.
      * - the caller must have a balance of at least `value`.
-     * - `inValue` must be a `InEuint128` to preserve confidentiality.
+     * - `inValue` must be a `InEuint164` to preserve confidentiality.
      */
-    function encTransfer(address to, InEuint128 memory inValue) external returns (euint128 transferred);
+    function encTransfer(address to, InEuint64 memory inValue) external returns (euint64 transferred);
 
     /**
      * @dev See {IERC20-transfer}.
@@ -150,9 +150,9 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      *
      * - `to` cannot be the zero address.
      * - the caller must have a balance of at least `value`.
-     * - `value` must be a `euint128` to preserve confidentiality.
+     * - `value` must be a `euint64` to preserve confidentiality.
      */
-    function encTransfer(address to, euint128 value) external returns (euint128 transferred);
+    function encTransfer(address to, euint64 value) external returns (euint64 transferred);
 
     /**
      * @dev See {IERC20-allowance}.
@@ -189,32 +189,32 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     function encTransferFromDirect(
         address from,
         address to,
-        InEuint128 memory inValue,
+        InEuint64 memory inValue,
         FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint128 transferred);
+    ) external returns (euint64 transferred);
 
     function encTransferFromDirectWithMax(
         address from,
         address to,
-        euint128 value,
-        InEuint128 memory inValue,
+        euint64 value,
+        InEuint64 memory inValue,
         FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint128 transferred);
+    ) external returns (euint64 transferred);
 
     function encTransferFrom(
         address from,
         address to,
-        euint128 value,
+        euint64 value,
         FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint128 transferred);
+    ) external returns (euint64 transferred);
 
     function encTransferFromWithMax(
         address from,
         address to,
-        euint128 value,
-        euint128 maxValue,
+        euint64 value,
+        euint64 maxValue,
         FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint128 transferred);
+    ) external returns (euint64 transferred);
 
     // EIP712 Permit
 

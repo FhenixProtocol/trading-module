@@ -35,7 +35,6 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     struct FHERC20_EIP712_Permit {
         address owner;
         address spender;
-        uint256 value_hash;
         uint256 deadline;
         uint8 v;
         bytes32 r;
@@ -49,6 +48,12 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * Note that `value` may be zero.
      */
     event ConfidentialTransfer(address indexed from, address indexed to, uint256 value_hash);
+
+    /**
+     * @dev Emitted when the expiration timestamp for an operator `operator` is updated for a given `holder`.
+     * The operator may move any amount of tokens on behalf of the holder until the timestamp `until`.
+     */
+    event OperatorSet(address indexed holder, address indexed operator, uint48 until);
 
     /**
      * @dev Returns true if the token is a FHERC20.
@@ -125,6 +130,18 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * Returns the euint64 representing the account's true balance (encrypted)
      */
     function confidentialBalanceOf(address account) external view returns (euint64);
+
+    /**
+     * @dev Returns true if `spender` is currently an operator for `holder`.
+     */
+    function isOperator(address holder, address spender) external view returns (bool);
+
+    /**
+     * @dev Sets `operator` as an operator for `holder` until the timestamp `until`.
+     *
+     * NOTE: An operator may transfer any amount of tokens on behalf of a holder while approved.
+     */
+    function setOperator(address operator, uint48 until) external;
 
     /**
      * @dev See {IERC20-transfer}.

@@ -30,18 +30,6 @@ import { euint64, InEuint64 } from "@fhenixprotocol/cofhe-contracts/FHE.sol";
  */
 interface IFHERC20 is IERC20, IERC20Metadata {
     /**
-     * @dev EIP712 Permit reusable struct
-     */
-    struct FHERC20_EIP712_Permit {
-        address owner;
-        address spender;
-        uint256 deadline;
-        uint8 v;
-        bytes32 r;
-        bytes32 s;
-    }
-
-    /**
      * @dev Emitted when `value_hash` encrypted tokens are moved from one account (`from`) to
      * another (`to`).
      *
@@ -211,46 +199,8 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     function confidentialTransferFromDirect(
         address from,
         address to,
-        InEuint64 memory inValue,
-        FHERC20_EIP712_Permit calldata permit
+        InEuint64 memory inValues
     ) external returns (euint64 transferred);
 
-    function confidentialTransferFromDirectWithMax(
-        address from,
-        address to,
-        euint64 value,
-        InEuint64 memory inValue,
-        FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint64 transferred);
-
-    function confidentialTransferFrom(
-        address from,
-        address to,
-        euint64 value,
-        FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint64 transferred);
-
-    function confidentialTransferFromWithMax(
-        address from,
-        address to,
-        euint64 value,
-        euint64 maxValue,
-        FHERC20_EIP712_Permit calldata permit
-    ) external returns (euint64 transferred);
-
-    // EIP712 Permit
-
-    /**
-     * @dev Returns the current nonce for `owner`. This value must be
-     * included whenever a signature is generated for {permit}.
-     *
-     * Every successful call to {permit} increases ``owner``'s nonce by one. This
-     * prevents a signature from being used multiple times.
-     */
-    function nonces(address owner) external view returns (uint256);
-    /**
-     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
-     */
-    // solhint-disable-next-line func-name-mixedcase
-    function DOMAIN_SEPARATOR() external view returns (bytes32);
+    function confidentialTransferFrom(address from, address to, euint64 value) external returns (euint64 transferred);
 }

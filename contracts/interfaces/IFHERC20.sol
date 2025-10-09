@@ -148,7 +148,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * - the caller must have a balance of at least `value`.
      * - `inValue` must be a `InEuint164` to preserve confidentiality.
      */
-    function confidentialTransfer(address to, InEuint64 memory inValue) external returns (euint64 transferred);
+    function confidentialTransferDirect(address to, InEuint64 memory inValue) external returns (euint64 transferred);
 
     /**
      * @dev See {IERC20-transfer}.

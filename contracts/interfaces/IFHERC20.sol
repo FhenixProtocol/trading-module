@@ -138,6 +138,28 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     function transfer(address, uint256) external pure returns (bool);
 
     /**
+     * @dev See {IERC20-allowance}.
+     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20.
+     * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
+     * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
+     */
+    function allowance(address, address) external pure returns (uint256);
+
+    /**
+     * @dev See {IERC20-approve}.
+     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20.
+     * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
+     * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
+     */
+    function approve(address, uint256) external pure returns (bool);
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20
+     */
+    function transferFrom(address, address, uint256) external pure returns (bool);
+
+    /**
      * @dev See {IERC20-transfer}.
      *
      * Intended to be used as a EOA call with an encrypted input `InEuint64 inValue`.
@@ -165,28 +187,6 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     function confidentialTransfer(address to, euint64 value) external returns (euint64 transferred);
 
     /**
-     * @dev See {IERC20-allowance}.
-     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20.
-     * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
-     * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
-     */
-    function allowance(address, address) external pure returns (uint256);
-
-    /**
-     * @dev See {IERC20-approve}.
-     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20.
-     * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
-     * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
-     */
-    function approve(address, uint256) external pure returns (bool);
-
-    /**
-     * @dev See {IERC20-transferFrom}.
-     * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20
-     */
-    function transferFrom(address, address, uint256) external pure returns (bool);
-
-    /**
      * @dev See {IERC20-transferFrom}.
      *
      * Requirements:
@@ -203,4 +203,30 @@ interface IFHERC20 is IERC20, IERC20Metadata {
     ) external returns (euint64 transferred);
 
     function confidentialTransferFrom(address from, address to, euint64 value) external returns (euint64 transferred);
+
+    function confidentialTransferDirectAndCall(
+        address to,
+        InEuint64 memory inValue,
+        bytes calldata data
+    ) external returns (euint64 transferred);
+
+    function confidentialTransferAndCall(
+        address to,
+        euint64 value,
+        bytes calldata data
+    ) external returns (euint64 transferred);
+
+    function confidentialTransferFromDirectAndCall(
+        address from,
+        address to,
+        InEuint64 memory inValue,
+        bytes calldata data
+    ) external returns (euint64 transferred);
+
+    function confidentialTransferFromAndCall(
+        address from,
+        address to,
+        euint64 value,
+        bytes calldata data
+    ) external returns (euint64 transferred);
 }

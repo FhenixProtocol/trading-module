@@ -135,7 +135,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * @dev See {IERC20-transfer}.
      * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20
      */
-    function transfer(address, uint256) external pure returns (bool);
+    function transfer(address to, uint256 value) external pure returns (bool);
 
     /**
      * @dev See {IERC20-allowance}.
@@ -143,7 +143,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
      * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
      */
-    function allowance(address, address) external pure returns (uint256);
+    function allowance(address owner, address spender) external pure returns (uint256);
 
     /**
      * @dev See {IERC20-approve}.
@@ -151,13 +151,13 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * Allowances have been removed from FHERC20s to prevent encrypted balance leakage.
      * Allowances have been replaced with an EIP712 permit for each `confidentialTransferFrom`.
      */
-    function approve(address, uint256) external pure returns (bool);
+    function approve(address spender, uint256 value) external pure returns (bool);
 
     /**
      * @dev See {IERC20-transferFrom}.
      * Always reverts to prevent FHERC20 from being unintentionally treated as an ERC20
      */
-    function transferFrom(address, address, uint256) external pure returns (bool);
+    function transferFrom(address from, address to, uint256 value) external pure returns (bool);
 
     /**
      * @dev See {IERC20-transfer}.
@@ -170,7 +170,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * - the caller must have a balance of at least `value`.
      * - `inValue` must be a `InEuint164` to preserve confidentiality.
      */
-    function confidentialTransferDirect(address to, InEuint64 memory inValue) external returns (euint64 transferred);
+    function confidentialTransfer(address to, InEuint64 memory inValue) external returns (euint64 transferred);
 
     /**
      * @dev See {IERC20-transfer}.
@@ -196,7 +196,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
      * - the caller must have allowance for ``from``'s tokens of at least
      * `value`.
      */
-    function confidentialTransferFromDirect(
+    function confidentialTransferFrom(
         address from,
         address to,
         InEuint64 memory inValues
@@ -204,7 +204,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
 
     function confidentialTransferFrom(address from, address to, euint64 value) external returns (euint64 transferred);
 
-    function confidentialTransferDirectAndCall(
+    function confidentialTransferAndCall(
         address to,
         InEuint64 memory inValue,
         bytes calldata data
@@ -216,7 +216,7 @@ interface IFHERC20 is IERC20, IERC20Metadata {
         bytes calldata data
     ) external returns (euint64 transferred);
 
-    function confidentialTransferFromDirectAndCall(
+    function confidentialTransferFromAndCall(
         address from,
         address to,
         InEuint64 memory inValue,

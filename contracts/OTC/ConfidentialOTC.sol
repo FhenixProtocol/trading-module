@@ -1,0 +1,1263 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
+
+import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
+import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
+import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
+import { FHE, euint64, euint8, ebool, InEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
+import { IFHERC20 } from '../interfaces/IFHERC20.sol';
+
+/// @title  ConfidentialOTC
+/// @author Rogue Rotkosky, Fhenix
+/// @notice Peer-to-peer confidential OTC trading between any two whitelisted
+///         FHERC20 tokens (cANY<>cANY). Order sizes and per-fill amounts are
+///         fully encrypted, but each order's size *bracket* is published as a
+///         plaintext uint8 on-chain so the book can be browsed, sorted, and
+///         filtered without any client-side decryption.
+/// @dev    Built on the CoFHE coprocessor: encrypted values are `euint*` handles
+///         whose plaintext is only ever revealed through a threshold-network
+///         decryption proof (`FHE.publishDecryptResult`). The full system
+///         reference lives in docs/otc/OTC_REFERENCE.md; the oracle/whitelist model in
+///         docs/otc/ORACLE.md (when present).
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Public bracket (the core mechanism)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// The bracket is still *computed* under FHE (`_computeBracket` → euint8), but
+/// its plaintext is written into the order via a threshold-decryption proof
+/// (`FHE.publishDecryptResult`). Every action that changes `eRemaining`
+/// (create / fill / top-up) snapshots its own bracket handle into a per-order
+/// `Publish` record keyed by a monotonic `seq`, then a second step
+/// (`publishBracket`) proves that handle's plaintext and updates the order.
+///
+/// Token transfers always stay atomic in the first transaction; the second
+/// step moves no value — it only reveals the bracket and, via the frontier
+/// rule, lists or delists the order.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Order lifecycle
+/// ──────────────────────────────────────────────────────────────────────────
+///
+///   pending  → created, input escrowed (+ optional maker bond); bracket not
+///              yet revealed, NOT discoverable or fillable.
+///   active   → bracket published non-EMPTY; listed in the pair index; fillable
+///              and top-up-able.
+///   dormant  → was active, last published bracket is EMPTY (depleted) or the
+///              order expired; delisted but NOT destroyed — escrow is retained
+///              and the order can be revived by a top-up whose publish re-lists
+///              it (the symmetric frontier rule).
+///   closed   → cancelled by the maker; terminal. Remaining escrow and the
+///              maker bond are returned. Outstanding fill bonds remain
+///              recoverable by their depositors.
+///
+/// Creation is two steps because the *bracket reveal* is two steps, not because
+/// of any fee: `createOrder` escrows and computes the encrypted bracket;
+/// `activateOrder` publishes it (the create record) and lists the order.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Seq, Publish records, and canonical selection
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Each order keeps `latestSeq` (bumped by every create/fill/top-up) and
+/// `publishedSeq` (highest seq whose bracket is canonical). A `publishBracket`
+/// only advances the displayed bracket when `seq > publishedSeq`; older or
+/// out-of-order publishes are swallowed (they still settle their own bond).
+/// Once `publishedSeq` passes a record's seq it is *absorbed* — its bracket no
+/// longer matters, but its depositor still publishes (proof-free of skim within
+/// the window) to settle and recover the bond.
+///
+/// The frontier rule: only a publish for the latest record (`seq == latestSeq`)
+/// changes listing — non-EMPTY lists/re-lists, EMPTY delists. This makes
+/// depletion self-evict and top-ups self-revive, and prevents a stale EMPTY
+/// proof from delisting an order that has since been refilled.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Bonds (ETH, USD-denominated via the ETH oracle)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// - Taker FILL bond: posted in `fillOrder`. Forces the mandatory post-fill
+///   publish that keeps the public bracket fresh. Within a depositor-exclusive
+///   grace window only the depositor may publish (full refund); after it,
+///   anyone may publish for a bounty (`bountyBps`), the remainder refunded to
+///   the depositor. This defeats mempool front-running of the proof.
+/// - Maker bond: an OPTIONAL anti-spam lever, `makerBondUsd`, defaulting to 0.
+///   Posted at `createOrder`, returned only on `cancelOrder`. Maker-initiated
+///   publishes (`activateOrder`, `topUpOrder`) are otherwise bondless and
+///   self-incentivized.
+///
+/// Bond sizes are denominated in 6-decimal USD and priced into wei via the ETH
+/// oracle price (`ethOraclePrice`, Q44.20 USD per whole ETH). `ethBondSize()`
+/// and `makerBondSize()` expose the instantaneous required wei.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Token whitelist & oracle
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Only whitelisted tokens may be traded. Each whitelisted token carries a
+/// Q44.20 oracle price (fUSD per whole token, scaled by 2^20) used solely for
+/// bracket computation — it does not affect fill math, which uses the
+/// maker-specified order price exclusively.
+///
+/// fUSD is auto-whitelisted in the constructor at oraclePrice = Q_DENOM ($1).
+/// Additional tokens are whitelisted by the owner via `whitelistToken`. Oracle
+/// prices (including the ETH price used for bonds) are updated by the
+/// designated `oracle` address (or the owner).
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Order model
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Maker creates an order specifying:
+///   - inputToken  : whitelisted FHERC20 they are giving into escrow.
+///   - outputToken : whitelisted FHERC20 they want in return.
+///   - price       : Q44.20 fixed-point rate — output units per input unit,
+///                   scaled by 2^20 (1_048_576). Examples:
+///                     $1.00  → 1_048_576
+///                     $0.50  → 524_288
+///                     $100   → 104_857_600
+///   - expiry      : unix timestamp after which the order can no longer be
+///                   filled. 0 = good-til-cancelled (never expires).
+///   - encAmount   : encrypted input token quantity (InEuint64).
+///
+/// All tokens are capped at 6 decimals (enforced at whitelist time); fUSD
+/// must use exactly 6 decimals (enforced in the constructor).
+///
+/// A maker may call `topUpOrder` to inject more input tokens (even into a
+/// dormant order, to revive it). Both `eRemaining` and `eDepositedAmount` grow
+/// by the actual transferred delta; the new bracket is published by a follow-up
+/// `publishBracket`.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Fill flow (value atomic in tx1; bracket published in tx2)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+///   encTokensWanted → eActual = min(eTokensWanted, eRemaining, overflowCap)
+///   eOutput         = eActual × price >> 20            // Q44.20
+///   eOutputPaid     = outputToken.transferFrom(taker, maker, eOutput)
+///   paidInFull      = (eOutputPaid == eOutput) && (eOutput > 0)
+///   eRelease        = paidInFull ? eActual : 0
+///   inputToken.transfer(taker, eRelease)               // from OTC escrow
+///   eRemaining     -= eRelease
+///   → snapshot the post-fill bracket into a Publish record (seq), post ETH bond
+///
+/// FHERC20 transfers are all-or-nothing: if the taker cannot cover the full
+/// `eOutput`, the payment moves 0 and `eOutputPaid != eOutput`, so `eRelease`
+/// is 0 and the escrow is untouched. This prevents a taker from draining input
+/// without paying. Takers must size their request to what they can afford.
+///
+/// Taker must have set the OTC as operator on their outputToken before calling
+/// fillOrder, and must call `publishBracket` afterward (within the grace window)
+/// to reveal the new bracket and reclaim their bond.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Brackets
+/// ──────────────────────────────────────────────────────────────────────────
+///
+///   0 = EMPTY    order is depleted or cancelled
+///   1 = NANO     < $100
+///   2 = SMALL    $100 – $1 000
+///   3 = MEDIUM   $1 000 – $10 000
+///   4 = LARGE    $10 000 – $100 000
+///   5 = WHALE    ≥ $100 000
+///   255 = UNPUBLISHED  sentinel before the first reveal (pending orders)
+///
+contract ConfidentialOTC is Ownable, ReentrancyGuard {
+    using EnumerableSet for EnumerableSet.UintSet;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Constants
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Q44.20 price denominator: 2^20 = 1_048_576.
+    uint64 public constant Q_DENOM = 1_048_576;
+
+    /// @dev fUSD must use exactly this many decimals — the bracket thresholds
+    ///      below are denominated in 6-decimal fUSD units.
+    uint8 public constant FUSD_DECIMALS = 6;
+
+    /// @dev Any whitelisted token may use at most this many decimals. Tokens
+    ///      with more than 6 decimals cannot be priced precisely in Q44.20.
+    ///      Enforced at whitelist time so createOrder never needs to re-check.
+    uint8 public constant MAX_TOKEN_DECIMALS = 6;
+
+    /// @dev Minimum oracle price (Q44.20). Prevents tokens so cheap that
+    ///      pairing them with expensive tokens overflows Q44.20 arithmetic.
+    uint64 public constant MIN_ORACLE_PRICE = 1;
+
+    /// @dev Basis-point denominator for the publish bounty split.
+    uint256 public constant BPS_DENOM = 10_000;
+
+    /// @dev seq assigned to the create record. Fills and top-ups increment from
+    ///      here, so the create record is always the first and is published by
+    ///      `activateOrder`.
+    uint64 internal constant CREATE_SEQ = 1;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bracket labels (plaintext for external callers; encrypted for FHE ops)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Depleted or cancelled order (USD-equivalent size is exactly 0).
+    uint8 public constant BRACKET_EMPTY = 0;
+    /// @notice < $100.
+    uint8 public constant BRACKET_NANO = 1;
+    /// @notice $100 – $1 000.
+    uint8 public constant BRACKET_SMALL = 2;
+    /// @notice $1 000 – $10 000.
+    uint8 public constant BRACKET_MEDIUM = 3;
+    /// @notice $10 000 – $100 000.
+    uint8 public constant BRACKET_LARGE = 4;
+    /// @notice ≥ $100 000.
+    uint8 public constant BRACKET_WHALE = 5;
+    /// @notice Sentinel for an order whose bracket has not been published yet.
+    uint8 public constant BRACKET_UNPUBLISHED = 255;
+
+    /// @dev Encrypted bracket values — precomputed in constructor to avoid
+    ///      repeated FHE.asEuint8 calls on every order create / fill.
+    euint8 private immutable _E_BRACKET_EMPTY;
+    euint8 private immutable _E_BRACKET_NANO;
+    euint8 private immutable _E_BRACKET_SMALL;
+    euint8 private immutable _E_BRACKET_MEDIUM;
+    euint8 private immutable _E_BRACKET_LARGE;
+    euint8 private immutable _E_BRACKET_WHALE;
+
+    /// @dev Encrypted bracket thresholds in raw fUSD units (6 decimals).
+    ///      Precomputed in constructor to avoid repeated FHE.asEuint64 calls.
+    euint64 private immutable _NANO_MAX; // 100_000_000   ($100)
+    euint64 private immutable _SMALL_MAX; // 1_000_000_000  ($1 000)
+    euint64 private immutable _MEDIUM_MAX; // 10_000_000_000  ($10 000)
+    euint64 private immutable _LARGE_MAX; // 100_000_000_000  ($100 000)
+
+    /// @dev Precomputed shift operand for the Q44.20 right-shift (÷ 2^20).
+    euint64 private immutable _E_SHR_20;
+
+    /// @dev Precomputed encrypted zero, reused for comparisons and fallbacks.
+    euint64 private immutable _E_ZERO64;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Token whitelist & oracle
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Per-token whitelist entry.
+    /// @dev    oraclePrice is Q44.20 (floor(usd_per_whole_token × 2^20)) and is
+    ///         used only for bracket computation — it does not affect fill math.
+    struct TokenConfig {
+        /// @dev Whether the token may be used as an order leg.
+        bool whitelisted;
+        /// @dev Q44.20 bracket price (floor(usd_per_whole_token × 2^20)).
+        uint64 oraclePrice;
+        /// @dev Timestamp of the last oraclePrice update.
+        uint64 priceUpdatedAt;
+    }
+
+    mapping(address => TokenConfig) private _tokenConfig;
+
+    /// @notice Address permitted to call `updateOraclePrice` / `setEthOraclePrice`.
+    ///         Owner always has the same privilege. Zero address disables the role.
+    address public oracle;
+
+    /// @notice ETH/USD oracle price, Q44.20 (floor(usd_per_whole_eth × 2^20)).
+    ///         Used to convert USD-denominated bond sizes into wei. Must be set
+    ///         before any bonded action whose USD size is non-zero.
+    uint64 public ethOraclePrice;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Governable bond / window parameters
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Taker fill bond, in 6-decimal USD. Default $5.
+    uint64 public fillBondUsd = 5_000_000;
+
+    /// @notice Optional maker anti-spam bond, in 6-decimal USD. Default 0 (off).
+    uint64 public makerBondUsd = 0;
+
+    /// @notice Publisher bounty after the grace window, in basis points. Default 20%.
+    uint256 public bountyBps = 2_000;
+
+    /// @notice Depositor-exclusive grace window for fill publishes, in seconds.
+    ///         Default 10 minutes.
+    uint64 public windowSeconds = 600;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // State
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The fUSD (confidential stablecoin) — the bracket unit of account.
+    IFHERC20 public immutable fUSD;
+
+    struct Order {
+        /// @dev Order creator; address(0) means the order does not exist.
+        address maker;
+        /// @dev Token the maker placed into escrow.
+        IFHERC20 inputToken;
+        /// @dev Token the maker receives from takers.
+        IFHERC20 outputToken;
+        /// @dev Encrypted remaining input balance. Decremented on each fill.
+        euint64 eRemaining;
+        /// @dev Cumulative encrypted total deposited into this order (strictly
+        ///      increasing). Increased by each top-up alongside eRemaining.
+        ///      FHE.allow'd to the maker; divide eRemaining by this to track
+        ///      fill progress across top-ups.
+        euint64 eDepositedAmount;
+        /// @dev Q44.20 price: output units per input unit × 2^20.
+        uint64 price;
+        /// @dev Unix timestamp after which the order cannot be filled.
+        ///      0 = good-til-cancelled.
+        uint64 expiry;
+        /// @dev Plaintext published bracket (0–5), or BRACKET_UNPUBLISHED while
+        ///      pending. Updated by `publishBracket` when seq > publishedSeq.
+        uint8 bracket;
+        /// @dev Highest seq assigned to this order (the frontier record).
+        uint64 latestSeq;
+        /// @dev Highest seq whose bracket is canonical (drives `bracket`).
+        uint64 publishedSeq;
+        /// @dev Maker bond escrowed in wei (0 when makerBondUsd is 0).
+        uint256 makerBondWei;
+        /// @dev True once activated and listed; false while pending/dormant/closed.
+        bool active;
+        /// @dev True between createOrder and the first successful publish.
+        bool pending;
+        /// @dev True once cancelled; terminal.
+        bool closed;
+    }
+
+    /// @notice Per-action bracket snapshot. Created in tx1 (create/fill/top-up)
+    ///         and consumed by `publishBracket`.
+    struct Publish {
+        /// @dev Encrypted bracket of eRemaining *after* this action. Immutable,
+        ///      so the proof is valid whenever it lands.
+        euint8 handle;
+        /// @dev Who posted the record (taker for fills; maker for create/top-up).
+        address depositor;
+        /// @dev Bond in wei. >0 only for fill records; 0 for maker records.
+        uint256 bondWei;
+        /// @dev tx1 timestamp + windowSeconds. Non-zero only for fill records.
+        uint64 deadline;
+        /// @dev True once the bond has been settled (published or withdrawn).
+        bool settled;
+    }
+
+    /// @notice Order storage, keyed by order id.
+    mapping(uint256 => Order) public orders;
+    /// @notice The id that will be assigned to the next created order.
+    uint256 public nextOrderId;
+
+    /// @dev Per-order publish records, keyed by seq.
+    mapping(uint256 => mapping(uint64 => Publish)) private _publishes;
+
+    /// @dev All order ids ever created by a maker (includes closed orders).
+    mapping(address => uint256[]) private _makerOrderIds;
+
+    /// @dev Active order ids keyed by keccak(inputToken, outputToken). Kept
+    ///      clean: ids are added on list and removed on delist / cancel.
+    mapping(bytes32 => EnumerableSet.UintSet) private _pairOrders;
+
+    /// @dev Distinct order ids a taker has filled (deduped via the set).
+    mapping(address => EnumerableSet.UintSet) private _takerFills;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Views: aggregate read shape
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Flattened, frontend-friendly projection of an order.
+    /// @dev    `bracket` is the plaintext published bracket (no decryption
+    ///         needed). `bracketHandle` is the frontier encrypted snapshot,
+    ///         exposed for an optional manual verification decrypt. Encrypted
+    ///         balance handles are decryptable only by the maker.
+    struct OrderView {
+        /// @dev Order creator.
+        address maker;
+        /// @dev Escrowed token leg.
+        address inputToken;
+        /// @dev Requested token leg.
+        address outputToken;
+        /// @dev Q44.20 order price (output per input).
+        uint64 price;
+        /// @dev Expiry timestamp (0 = good-til-cancelled).
+        uint64 expiry;
+        /// @dev Plaintext published bracket (0–5), or BRACKET_UNPUBLISHED.
+        uint8 bracket;
+        /// @dev Highest seq assigned (the frontier record).
+        uint64 latestSeq;
+        /// @dev Highest seq whose bracket is canonical.
+        uint64 publishedSeq;
+        /// @dev Frontier encrypted bracket handle (for optional manual decrypt).
+        bytes32 bracketHandle;
+        /// @dev Encrypted remaining balance handle (maker-decryptable).
+        bytes32 remainingHandle;
+        /// @dev Encrypted cumulative deposited handle (maker-decryptable).
+        bytes32 depositedHandle;
+        /// @dev True while listed and fillable.
+        bool active;
+        /// @dev True before the first successful publish.
+        bool pending;
+        /// @dev True once cancelled (terminal).
+        bool closed;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Events
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A token was added to the trading whitelist.
+    /// @param  token       The whitelisted token.
+    /// @param  oraclePrice The initial Q44.20 oracle price assigned to it.
+    event TokenWhitelisted(address indexed token, uint64 oraclePrice);
+
+    /// @notice A token was removed from the whitelist (existing orders are unaffected).
+    /// @param  token The delisted token.
+    event TokenDelisted(address indexed token);
+
+    /// @notice A whitelisted token's bracket oracle price was updated.
+    /// @param  token       The token whose price changed.
+    /// @param  oraclePrice The new Q44.20 price.
+    event OraclePriceUpdated(address indexed token, uint64 oraclePrice);
+
+    /// @notice The ETH/USD oracle price used to size ETH bonds was updated.
+    /// @param  oraclePrice The new Q44.20 USD-per-ETH price.
+    event EthOraclePriceUpdated(uint64 oraclePrice);
+
+    /// @notice The governable bond / window parameters were retuned.
+    /// @param  fillBondUsd   New taker fill bond (6-decimal USD).
+    /// @param  makerBondUsd  New maker bond (6-decimal USD).
+    /// @param  bountyBps     New post-window publisher bounty (basis points).
+    /// @param  windowSeconds New depositor-exclusive window length (seconds).
+    event ParamsUpdated(uint64 fillBondUsd, uint64 makerBondUsd, uint256 bountyBps, uint64 windowSeconds);
+
+    /// @notice A new order was created (step 1). The order is NOT yet discoverable
+    ///         or fillable — indexers should wait for {OrderActivated}.
+    /// @param  orderId     The assigned order id.
+    /// @param  maker       The order creator.
+    /// @param  inputToken  The escrowed token leg.
+    /// @param  outputToken The requested token leg.
+    /// @param  price       The Q44.20 order price (output per input).
+    /// @param  expiry      The expiry timestamp (0 = good-til-cancelled).
+    event OrderCreated(
+        uint256 indexed orderId,
+        address indexed maker,
+        address indexed inputToken,
+        address outputToken,
+        uint64 price,
+        uint64 expiry
+    );
+
+    /// @notice Emitted the first time an order's bracket is published non-EMPTY and
+    ///         it joins the pair index. Order-book indexers should key off this.
+    /// @param  orderId The activated order.
+    event OrderActivated(uint256 indexed orderId);
+
+    /// @notice An order was filled (step 1; the swap settled atomically).
+    /// @param  orderId The filled order.
+    /// @param  taker   The filler (and fill-bond depositor).
+    /// @param  seq     The post-fill bracket snapshot awaiting {publishBracket}.
+    event OrderFilled(uint256 indexed orderId, address indexed taker, uint64 seq);
+
+    /// @notice A maker injected more input tokens into an order (step 1).
+    /// @param  orderId The topped-up order.
+    /// @param  maker   The order's maker.
+    /// @param  seq     The new bracket snapshot awaiting {publishBracket}.
+    event OrderToppedUp(uint256 indexed orderId, address indexed maker, uint64 seq);
+
+    /// @notice An order was cancelled by its maker (terminal).
+    /// @param  orderId The cancelled order.
+    event OrderCancelled(uint256 indexed orderId);
+
+    /// @notice A bracket snapshot was published (whether or not it advanced the
+    ///         canonical bracket).
+    /// @param  orderId   The order.
+    /// @param  seq       The published record's seq.
+    /// @param  bracket   The decrypted plaintext bracket.
+    /// @param  publisher The caller that submitted the proof.
+    /// @param  listed    The order's listing state after this publish.
+    event BracketPublished(
+        uint256 indexed orderId,
+        uint64 indexed seq,
+        uint8 bracket,
+        address indexed publisher,
+        bool listed
+    );
+
+    /// @notice An order left the pair index (frontier EMPTY publish → dormant).
+    /// @param  orderId The delisted order.
+    event OrderDelisted(uint256 indexed orderId);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Errors
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A required address argument was the zero address.
+    error ZeroAddress();
+    /// @notice inputToken and outputToken were the same token.
+    error SameLeg();
+    /// @notice A price or oracle price was zero / below MIN_ORACLE_PRICE.
+    error ZeroPrice();
+    /// @notice A token's decimals are incompatible (fUSD != 6, or token > 6).
+    error InvalidDecimals();
+    /// @notice The supplied expiry is already in the past.
+    error InvalidExpiry();
+    /// @notice A token leg is not whitelisted for trading.
+    /// @param  token The offending token.
+    error TokenNotWhitelisted(address token);
+    /// @notice Caller is neither the oracle nor the owner.
+    error Unauthorized();
+    /// @notice No order exists for the given id.
+    error OrderNotFound();
+    /// @notice The order is not active (pending, dormant, or closed).
+    error OrderNotActive();
+    /// @notice The order has been cancelled (terminal).
+    error OrderClosed();
+    /// @notice The order is past its expiry timestamp.
+    error OrderExpired();
+    /// @notice Caller is not the order's maker.
+    error NotMaker();
+    /// @notice Array argument lengths do not match.
+    error LengthMismatch();
+    /// @notice A bonded action was attempted before `ethOraclePrice` was set.
+    error EthOracleUnset();
+    /// @notice msg.value did not cover the required bond, or bountyBps > BPS_DENOM.
+    error WrongBond();
+    /// @notice No publish record exists for the given (orderId, seq).
+    error PublishNotFound();
+    /// @notice The publish record's bond has already been settled.
+    error AlreadySettled();
+    /// @notice A non-depositor tried to publish a fill record inside its window.
+    error NotInWindow();
+    /// @notice A native ETH transfer (refund / bounty) failed.
+    error EthTransferFailed();
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Constructor
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Deploy the OTC, anchoring it to the fUSD unit of account.
+    /// @dev    Validates fUSD's decimals, auto-whitelists it at $1.00 (Q_DENOM),
+    ///         and precomputes the reusable encrypted bracket constants/thresholds
+    ///         (persisting their ACL so they remain valid operands in later txns).
+    ///         The deployer becomes the owner. `ethOraclePrice` starts unset and
+    ///         must be configured via {setEthOraclePrice} before any bonded action.
+    /// @param  fUSD_ The confidential stablecoin used as the bracket unit of account.
+    constructor(IFHERC20 fUSD_) Ownable(msg.sender) {
+        if (address(fUSD_) == address(0)) revert ZeroAddress();
+        if (fUSD_.decimals() != FUSD_DECIMALS) revert InvalidDecimals();
+        fUSD = fUSD_;
+
+        // Auto-whitelist fUSD at $1.00 in Q44.20 (= Q_DENOM).
+        // fUSD is the bracket unit of account, so its oracle price is always 1.
+        _tokenConfig[address(fUSD_)] = TokenConfig({
+            whitelisted: true,
+            oraclePrice: Q_DENOM,
+            priceUpdatedAt: uint64(block.timestamp)
+        });
+
+        _E_BRACKET_EMPTY = FHE.asEuint8(BRACKET_EMPTY);
+        _E_BRACKET_NANO = FHE.asEuint8(BRACKET_NANO);
+        _E_BRACKET_SMALL = FHE.asEuint8(BRACKET_SMALL);
+        _E_BRACKET_MEDIUM = FHE.asEuint8(BRACKET_MEDIUM);
+        _E_BRACKET_LARGE = FHE.asEuint8(BRACKET_LARGE);
+        _E_BRACKET_WHALE = FHE.asEuint8(BRACKET_WHALE);
+
+        _NANO_MAX = FHE.asEuint64(100_000_000);
+        _SMALL_MAX = FHE.asEuint64(1_000_000_000);
+        _MEDIUM_MAX = FHE.asEuint64(10_000_000_000);
+        _LARGE_MAX = FHE.asEuint64(100_000_000_000);
+
+        _E_SHR_20 = FHE.asEuint64(20);
+        _E_ZERO64 = FHE.asEuint64(0);
+
+        // Persist ACL on every reused handle so they remain usable as operands
+        // in later transactions (the auto-grant from FHE.asEuint* is transient).
+        FHE.allowThis(_E_BRACKET_EMPTY);
+        FHE.allowThis(_E_BRACKET_NANO);
+        FHE.allowThis(_E_BRACKET_SMALL);
+        FHE.allowThis(_E_BRACKET_MEDIUM);
+        FHE.allowThis(_E_BRACKET_LARGE);
+        FHE.allowThis(_E_BRACKET_WHALE);
+        FHE.allowThis(_NANO_MAX);
+        FHE.allowThis(_SMALL_MAX);
+        FHE.allowThis(_MEDIUM_MAX);
+        FHE.allowThis(_LARGE_MAX);
+        FHE.allowThis(_E_SHR_20);
+        FHE.allowThis(_E_ZERO64);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Admin: token whitelist & oracle
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Whitelist a token, enabling it as an input or output leg.
+    /// @dev    Enforces MAX_TOKEN_DECIMALS so createOrder never needs to re-check.
+    /// @param  token        The token to whitelist.
+    /// @param  initialPrice The token's initial Q44.20 oracle price (≥ MIN_ORACLE_PRICE).
+    function whitelistToken(address token, uint64 initialPrice) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        if (initialPrice < MIN_ORACLE_PRICE) revert ZeroPrice();
+        if (IFHERC20(token).decimals() > MAX_TOKEN_DECIMALS) revert InvalidDecimals();
+        _tokenConfig[token] = TokenConfig({
+            whitelisted: true,
+            oraclePrice: initialPrice,
+            priceUpdatedAt: uint64(block.timestamp)
+        });
+        emit TokenWhitelisted(token, initialPrice);
+    }
+
+    /// @notice Remove a token from the whitelist.
+    /// @dev    Existing orders for this token are unaffected; only new orders
+    ///         are blocked.
+    /// @param  token The token to delist.
+    function delistToken(address token) external onlyOwner {
+        _tokenConfig[token].whitelisted = false;
+        emit TokenDelisted(token);
+    }
+
+    /// @notice Set the oracle address. Zero address disables the oracle role.
+    /// @param  oracle_ The new oracle address (or address(0) to disable).
+    function setOracle(address oracle_) external onlyOwner {
+        oracle = oracle_;
+    }
+
+    /// @notice Update the Q44.20 oracle price for a whitelisted token.
+    /// @dev    Callable by the designated oracle or the owner. The price is used
+    ///         only for bracket computation and does not affect open orders.
+    /// @param  token The whitelisted token to reprice.
+    /// @param  price The new Q44.20 price (≥ MIN_ORACLE_PRICE).
+    function updateOraclePrice(address token, uint64 price) external {
+        if (msg.sender != oracle && msg.sender != owner()) revert Unauthorized();
+        if (!_tokenConfig[token].whitelisted) revert TokenNotWhitelisted(token);
+        if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
+        _tokenConfig[token].oraclePrice = price;
+        _tokenConfig[token].priceUpdatedAt = uint64(block.timestamp);
+        emit OraclePriceUpdated(token, price);
+    }
+
+    /// @notice Update the ETH/USD oracle price (Q44.20) used to size ETH bonds.
+    /// @dev    Callable by the designated oracle or the owner.
+    /// @param  price The new Q44.20 USD-per-ETH price (≥ MIN_ORACLE_PRICE).
+    function setEthOraclePrice(uint64 price) external {
+        if (msg.sender != oracle && msg.sender != owner()) revert Unauthorized();
+        if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
+        ethOraclePrice = price;
+        emit EthOraclePriceUpdated(price);
+    }
+
+    /// @notice Update the governable bond / window parameters. Owner only.
+    /// @dev    Reverts if `bountyBps_` exceeds BPS_DENOM (100%).
+    /// @param  fillBondUsd_   Taker fill bond, in 6-decimal USD.
+    /// @param  makerBondUsd_  Maker anti-spam bond, in 6-decimal USD (0 = off).
+    /// @param  bountyBps_     Post-window publisher bounty, in basis points.
+    /// @param  windowSeconds_ Depositor-exclusive window length, in seconds.
+    function setParams(
+        uint64 fillBondUsd_,
+        uint64 makerBondUsd_,
+        uint256 bountyBps_,
+        uint64 windowSeconds_
+    ) external onlyOwner {
+        if (bountyBps_ > BPS_DENOM) revert WrongBond();
+        fillBondUsd = fillBondUsd_;
+        makerBondUsd = makerBondUsd_;
+        bountyBps = bountyBps_;
+        windowSeconds = windowSeconds_;
+        emit ParamsUpdated(fillBondUsd_, makerBondUsd_, bountyBps_, windowSeconds_);
+    }
+
+    /// @notice Return the whitelist config for a token.
+    /// @param  token The token to query.
+    /// @return The token's {TokenConfig} (whitelisted flag, oracle price, timestamp).
+    function getTokenConfig(address token) external view returns (TokenConfig memory) {
+        return _tokenConfig[token];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bond sizing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Instantaneous taker fill bond, in wei.
+    /// @dev    Reverts with {EthOracleUnset} if the ETH price has not been set
+    ///         and the bond is non-zero.
+    /// @return The required fill bond, in wei.
+    function ethBondSize() public view returns (uint256) {
+        return _usdToWei(fillBondUsd);
+    }
+
+    /// @notice Instantaneous maker bond, in wei (0 when makerBondUsd is 0).
+    /// @return The required maker bond, in wei.
+    function makerBondSize() public view returns (uint256) {
+        return _usdToWei(makerBondUsd);
+    }
+
+    /// @dev Converts a 6-decimal USD amount to wei via the ETH oracle price:
+    ///      wei = usd6 × 1e12 × Q_DENOM / ethOraclePrice. (1e12 bridges the
+    ///      6→18 decimal gap; Q_DENOM cancels the Q44.20 price scaling.)
+    /// @param  usd6 The USD amount, scaled by 1e6.
+    /// @return The equivalent wei (0 when `usd6` is 0).
+    function _usdToWei(uint64 usd6) internal view returns (uint256) {
+        if (usd6 == 0) return 0;
+        if (ethOraclePrice == 0) revert EthOracleUnset();
+        return (uint256(usd6) * 1e12 * Q_DENOM) / ethOraclePrice;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Maker: create (step 1)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Post a new OTC order. The order starts PENDING: its escrow (and
+    ///         the optional maker bond) are pulled here, but it is not
+    ///         discoverable or fillable until `activateOrder` publishes the
+    ///         bracket.
+    ///
+    /// @dev    Maker must have approved the OTC as operator on `inputToken`.
+    ///         If `makerBondUsd > 0`, send at least `makerBondSize()` wei; any
+    ///         excess is refunded. Both tokens must be whitelisted.
+    ///
+    /// @param inputToken  Whitelisted FHERC20 the maker is offering (escrowed here).
+    /// @param outputToken Whitelisted FHERC20 the maker wants in return.
+    /// @param price       Q44.20 rate: output per input, scaled by 2^20.
+    /// @param expiry      Unix timestamp after which the order can no longer be
+    ///                    filled. Pass 0 for good-til-cancelled.
+    /// @param encAmount   Encrypted input amount (InEuint64 signed for this contract).
+    /// @return orderId    The id assigned to the new (pending) order.
+    function createOrder(
+        IFHERC20 inputToken,
+        IFHERC20 outputToken,
+        uint64 price,
+        uint64 expiry,
+        InEuint64 calldata encAmount
+    ) external payable nonReentrant returns (uint256 orderId) {
+        if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
+        if (address(inputToken) == address(outputToken)) revert SameLeg();
+        if (!_tokenConfig[address(inputToken)].whitelisted) revert TokenNotWhitelisted(address(inputToken));
+        if (!_tokenConfig[address(outputToken)].whitelisted) revert TokenNotWhitelisted(address(outputToken));
+        if (price == 0) revert ZeroPrice();
+        if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
+
+        // Maker bond (optional anti-spam lever; usually 0).
+        uint256 bond = makerBondSize();
+        if (msg.value < bond) revert WrongBond();
+
+        // Wrap the encrypted input and grant the inputToken contract ACL access
+        // so it can process the handle during transferFrom.
+        euint64 amount = FHE.asEuint64(encAmount);
+        FHE.allow(amount, address(inputToken));
+
+        // Pull input tokens into escrow.  FHERC20 transfers are all-or-nothing:
+        // if the maker's balance is below `amount`, `actual` returns as 0 and the
+        // order is created empty (EMPTY bracket); otherwise it equals `amount`.
+        euint64 actual = inputToken.confidentialTransferFrom(msg.sender, address(this), amount);
+        FHE.allowThis(actual);
+        FHE.allow(actual, msg.sender); // maker can verify their deposit / track fills
+
+        orderId = nextOrderId++;
+        Order storage o = orders[orderId];
+        o.maker = msg.sender;
+        o.inputToken = inputToken;
+        o.outputToken = outputToken;
+        o.eRemaining = actual;
+        o.eDepositedAmount = actual; // same handle; ACL already granted above
+        o.price = price;
+        o.expiry = expiry;
+        o.bracket = BRACKET_UNPUBLISHED;
+        o.latestSeq = CREATE_SEQ;
+        o.publishedSeq = 0;
+        o.makerBondWei = bond;
+        o.active = false;
+        o.pending = true;
+        o.closed = false;
+
+        // ── Bracket snapshot (create record) ───────────────────────────────────
+        // Convert the escrowed input to USD-equivalent and compute the size
+        // bracket via FHE comparisons — the maker cannot misrepresent their size.
+        // Order is stored first so _toUSD can inspect both legs. The plaintext is
+        // revealed later by activateOrder. Maker record: bondless, no window.
+        euint8 b = _computeBracket(_toUSD(actual, o));
+        _publishes[orderId][CREATE_SEQ] = Publish({
+            handle: b,
+            depositor: msg.sender,
+            bondWei: 0,
+            deadline: 0,
+            settled: false
+        });
+
+        _makerOrderIds[msg.sender].push(orderId);
+
+        if (msg.value > bond) _payEth(msg.sender, msg.value - bond);
+
+        emit OrderCreated(orderId, msg.sender, address(inputToken), address(outputToken), price, expiry);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Maker: activate (step 2) — first bracket reveal
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Publish the create record's bracket and list the order. This is
+    ///         the first reveal of the public bracket. Sugar for
+    ///         `publishBracket(orderId, CREATE_SEQ, ...)`.
+    ///
+    /// @dev    Permissionless and bondless (maker record). The
+    ///         `(decryptedBracket, signature)` pair comes from the CoFHE SDK
+    ///         decrypting the public bracket handle.
+    /// @param  orderId         The pending order to activate.
+    /// @param  decryptedBracket The threshold-decrypted plaintext of the create
+    ///                          record's bracket handle.
+    /// @param  signature        The threshold-network signature over that decryption.
+    function activateOrder(uint256 orderId, uint8 decryptedBracket, bytes calldata signature) external nonReentrant {
+        _publish(orderId, CREATE_SEQ, decryptedBracket, signature);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Maker: top up
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Inject additional input tokens into an order (active or dormant).
+    ///
+    /// @dev    Maker only; the order must not be closed. Both `eRemaining` and
+    ///         `eDepositedAmount` increase by the amount actually transferred
+    ///         (all-or-nothing). A new bracket snapshot is recorded under a fresh
+    ///         seq; call `publishBracket(orderId, seq, ...)` to reveal it. If the
+    ///         order was dormant, that publish re-lists it (frontier rule).
+    ///
+    ///         Bondless and self-incentivized: a stale top-up only under-reports
+    ///         the order's size, which is favorable to the order.
+    ///
+    /// @param orderId   The order to increase.
+    /// @param encDelta  Encrypted additional input-token amount (InEuint64).
+    /// @return seq      The seq of the new bracket snapshot to publish.
+    function topUpOrder(uint256 orderId, InEuint64 calldata encDelta) external nonReentrant returns (uint64 seq) {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+        if (o.closed) revert OrderClosed();
+        if (msg.sender != o.maker) revert NotMaker();
+
+        euint64 delta = FHE.asEuint64(encDelta);
+        FHE.allow(delta, address(o.inputToken));
+
+        // Pull additional tokens into OTC escrow (all-or-nothing).
+        euint64 actual = o.inputToken.confidentialTransferFrom(msg.sender, address(this), delta);
+        FHE.allowThis(actual);
+
+        // Grow remaining balance.
+        o.eRemaining = FHE.add(o.eRemaining, actual);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker);
+
+        // Strictly increase the cumulative deposited total (fill-progress denominator).
+        o.eDepositedAmount = FHE.add(o.eDepositedAmount, actual);
+        FHE.allowThis(o.eDepositedAmount);
+        FHE.allow(o.eDepositedAmount, o.maker);
+
+        // Snapshot the new bracket under a fresh seq (maker record: bondless).
+        seq = ++o.latestSeq;
+        euint8 b = _computeBracket(_toUSD(o.eRemaining, o));
+        _publishes[orderId][seq] = Publish({
+            handle: b,
+            depositor: msg.sender,
+            bondWei: 0,
+            deadline: 0,
+            settled: false
+        });
+
+        emit OrderToppedUp(orderId, msg.sender, seq);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Taker: fill (step 1 — value moves atomically here)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Fill an open order (partially or fully). The economic swap settles
+    ///         atomically here; the taker posts an ETH fill bond and must then
+    ///         call `publishBracket(orderId, seq, ...)` to reveal the post-fill
+    ///         bracket and reclaim the bond.
+    ///
+    /// @dev    Taker must have called `outputToken.setOperator(address(this), …)`
+    ///         before calling this function. Send at least `ethBondSize()` wei;
+    ///         any excess is refunded.
+    ///
+    /// @param orderId         The order to fill against.
+    /// @param encTokensWanted Encrypted amount of inputToken the taker wants.
+    /// @return seq            The seq of the post-fill bracket snapshot to publish.
+    function fillOrder(
+        uint256 orderId,
+        InEuint64 calldata encTokensWanted
+    ) external payable nonReentrant returns (uint64 seq) {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+        if (!o.active) revert OrderNotActive();
+        if (o.expiry != 0 && block.timestamp > o.expiry) revert OrderExpired();
+
+        // Fill bond.
+        uint256 bond = ethBondSize();
+        if (msg.value < bond) revert WrongBond();
+
+        // ── Settle the swap atomically (isolated frame to bound stack depth) ───
+        _swap(o, encTokensWanted);
+
+        // ── Snapshot the post-fill bracket under a fresh seq (fill record) ─────
+        seq = ++o.latestSeq;
+        _publishes[orderId][seq] = Publish({
+            handle: _computeBracket(_toUSD(o.eRemaining, o)),
+            depositor: msg.sender,
+            bondWei: bond,
+            deadline: uint64(block.timestamp) + windowSeconds,
+            settled: false
+        });
+
+        // Record the interaction for the taker's activity feed (set dedupes).
+        _takerFills[msg.sender].add(orderId);
+
+        if (msg.value > bond) _payEth(msg.sender, msg.value - bond);
+
+        emit OrderFilled(orderId, msg.sender, seq);
+    }
+
+    /// @dev The encrypted swap: caps the request, pulls the taker's payment to
+    ///      the maker, releases escrowed input on full payment, and decrements
+    ///      `eRemaining`. Isolated from `fillOrder` so its locals occupy a
+    ///      separate stack frame (keeps the IR/legacy stack within bounds).
+    /// @param o               The order being filled (mutated in place).
+    /// @param encTokensWanted The taker's encrypted requested input amount.
+    function _swap(Order storage o, InEuint64 calldata encTokensWanted) internal {
+        // Cap requested amount at available remaining and the overflow bound.
+        // FHE.mul below is mod 2^64; cap so eActual × price never wraps.
+        euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted), o.eRemaining);
+        eActual = FHE.min(eActual, FHE.asEuint64(type(uint64).max / o.price));
+        FHE.allowThis(eActual);
+
+        // Output cost via Q44.20 price: eActual × price >> 20.
+        euint64 eOutput = FHE.shr(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_SHR_20);
+        FHE.allowThis(eOutput);
+
+        // Pull output from taker directly to maker (no intermediate escrow).
+        FHE.allow(eOutput, address(o.outputToken));
+        euint64 eOutputPaid = o.outputToken.confidentialTransferFrom(msg.sender, o.maker, eOutput);
+        FHE.allowThis(eOutputPaid);
+
+        // Release input only if the taker paid in full (and not dust).
+        euint64 eRelease = FHE.select(
+            FHE.and(FHE.eq(eOutputPaid, eOutput), FHE.gt(eOutput, _E_ZERO64)),
+            eActual,
+            _E_ZERO64
+        );
+        FHE.allowThis(eRelease);
+
+        // Send released input from OTC escrow to taker.
+        FHE.allow(eRelease, address(o.inputToken));
+        FHE.allow(eRelease, msg.sender); // taker can verify receipt
+        o.inputToken.confidentialTransfer(msg.sender, eRelease);
+
+        // Decrement remaining.
+        o.eRemaining = FHE.sub(o.eRemaining, eRelease);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker); // maker can track their position
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Anyone (subject to window): publish a bracket / settle a bond
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Reveal the plaintext bracket for a Publish record and settle its
+    ///         bond. Advances the order's canonical bracket if `seq` is ahead of
+    ///         `publishedSeq`, and lists/delists the order if `seq` is the
+    ///         frontier (the symmetric frontier rule).
+    ///
+    /// @dev    For fill records: within the grace window only the depositor may
+    ///         call (full refund); after the window anyone may call (bounty to
+    ///         caller, remainder to depositor). Maker records (create/top-up)
+    ///         carry no bond/window and may be published by anyone.
+    /// @param  orderId          The order whose record is being published.
+    /// @param  seq              The record's seq (from {OrderFilled}/{OrderToppedUp}).
+    /// @param  decryptedBracket The threshold-decrypted bracket plaintext.
+    /// @param  signature        The threshold-network signature over the decryption.
+    function publishBracket(
+        uint256 orderId,
+        uint64 seq,
+        uint8 decryptedBracket,
+        bytes calldata signature
+    ) external nonReentrant {
+        _publish(orderId, seq, decryptedBracket, signature);
+    }
+
+    /// @dev Shared publish path for {activateOrder} and {publishBracket}: enforces
+    ///      the fill-record window, verifies the decryption proof against the
+    ///      record's immutable handle, advances the canonical bracket when the
+    ///      record is ahead, applies the frontier listing/delisting rule, and
+    ///      settles the bond. A bounty is paid only for an out-of-window publish
+    ///      of the live frontier (the only publish that keeps the book fresh);
+    ///      every other settlement refunds the depositor in full, so there is
+    ///      nothing to skim on absorbed/non-frontier/closed records.
+    /// @param orderId   The order being published.
+    /// @param seq       The record's seq.
+    /// @param value     The claimed plaintext bracket.
+    /// @param signature The threshold-network signature over `value`.
+    function _publish(uint256 orderId, uint64 seq, uint8 value, bytes calldata signature) internal {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+
+        Publish storage p = _publishes[orderId][seq];
+        if (p.depositor == address(0)) revert PublishNotFound();
+        if (p.settled) revert AlreadySettled();
+
+        bool bonded = (p.deadline != 0);
+
+        // Window enforcement (fill records only): inside the window only the
+        // depositor may publish, which removes the front-running race entirely.
+        if (bonded && block.timestamp <= p.deadline && msg.sender != p.depositor) {
+            revert NotInWindow();
+        }
+
+        // Verify the plaintext against the snapshot handle.
+        FHE.publishDecryptResult(p.handle, value, signature);
+
+        // Canonical bracket + listing (skipped once closed: bracket is moot, we
+        // only settle the bond).
+        bool listed = o.active;
+        if (!o.closed) {
+            if (seq > o.publishedSeq) {
+                o.publishedSeq = seq;
+                o.bracket = value;
+            }
+
+            // Frontier rule: only a publish for the latest record changes listing.
+            if (seq == o.latestSeq) {
+                if (value != BRACKET_EMPTY) {
+                    if (!o.active) {
+                        bool wasPending = o.pending;
+                        o.active = true;
+                        o.pending = false;
+                        _pairOrders[_pairKey(address(o.inputToken), address(o.outputToken))].add(orderId);
+                        if (wasPending) emit OrderActivated(orderId);
+                    }
+                } else if (o.active) {
+                    o.active = false;
+                    _pairOrders[_pairKey(address(o.inputToken), address(o.outputToken))].remove(orderId);
+                    emit OrderDelisted(orderId);
+                }
+            }
+            listed = o.active;
+        }
+
+        // Settle the bond. A bounty is only ever paid to keep the *live* book
+        // fresh, which means an out-of-window publish of the current frontier
+        // (`seq == latestSeq`) on an open order. Everything else — in-window
+        // publishes, and any non-frontier or closed-order publish — refunds the
+        // depositor in full. This removes the incentive for a keeper to publish
+        // an absorbed (already-superseded) record purely to skim the bounty.
+        p.settled = true;
+        if (bonded) {
+            bool frontierPublish = !o.closed && seq == o.latestSeq;
+            if (block.timestamp <= p.deadline || !frontierPublish) {
+                _payEth(p.depositor, p.bondWei);
+            } else {
+                // After window, live frontier → bounty to publisher, remainder
+                // to depositor.
+                uint256 bounty = (p.bondWei * bountyBps) / BPS_DENOM;
+                if (bounty > 0) _payEth(msg.sender, bounty);
+                _payEth(p.depositor, p.bondWei - bounty);
+            }
+        }
+
+        emit BracketPublished(orderId, seq, value, msg.sender, listed);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Maker: cancel
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Cancel an order and return the remaining escrow AND the maker
+    ///         bond to the maker. Works in the pending, active, and dormant
+    ///         states. Maker only; terminal.
+    ///
+    /// @dev    Outstanding fill Publish records survive: their depositors can
+    ///         still publish to settle and recover their bonds. The canonical
+    ///         bracket is moot once closed.
+    /// @param  orderId The order to cancel.
+    function cancelOrder(uint256 orderId) external nonReentrant {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+        if (msg.sender != o.maker) revert NotMaker();
+        if (o.closed) revert OrderClosed();
+
+        bool wasActive = o.active;
+        o.active = false;
+        o.pending = false;
+        o.closed = true;
+        o.bracket = BRACKET_EMPTY;
+
+        if (wasActive) {
+            _pairOrders[_pairKey(address(o.inputToken), address(o.outputToken))].remove(orderId);
+        }
+
+        // Return escrowed input.
+        FHE.allow(o.eRemaining, address(o.inputToken));
+        o.inputToken.confidentialTransfer(o.maker, o.eRemaining);
+
+        // Return the maker bond, if any.
+        uint256 bond = o.makerBondWei;
+        if (bond > 0) {
+            o.makerBondWei = 0;
+            _payEth(o.maker, bond);
+        }
+
+        emit OrderCancelled(orderId);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Views
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Returns the flattened public projection of an order.
+    /// @param  orderId The order to project.
+    /// @return The {OrderView} for `orderId`.
+    function getOrder(uint256 orderId) external view returns (OrderView memory) {
+        return _view(orderId);
+    }
+
+    /// @notice Batch variant of getOrder — hydrate any list of ids in one call.
+    /// @param  ids   The order ids to project.
+    /// @return views One {OrderView} per id, in the same order.
+    function getOrdersBatch(uint256[] calldata ids) external view returns (OrderView[] memory views) {
+        views = new OrderView[](ids.length);
+        for (uint256 i = 0; i < ids.length; i++) {
+            views[i] = _view(ids[i]);
+        }
+    }
+
+    /// @notice Active order ids for a directional pair (inputToken → outputToken).
+    /// @dev    Directional: getOrdersByPair(TOKEN, fUSD) returns orders selling
+    ///         TOKEN for fUSD; pass the legs reversed for the opposite side.
+    /// @param  inputToken  The escrowed leg to match on.
+    /// @param  outputToken The requested leg to match on.
+    /// @return The active order ids listed for that directional pair.
+    function getOrdersByPair(address inputToken, address outputToken) external view returns (uint256[] memory) {
+        return _pairOrders[_pairKey(inputToken, outputToken)].values();
+    }
+
+    /// @notice All order ids a maker has ever created (includes closed orders).
+    /// @param  maker The maker to query.
+    /// @return The maker's order ids, in creation order.
+    function getMakerOrderIds(address maker) external view returns (uint256[] memory) {
+        return _makerOrderIds[maker];
+    }
+
+    /// @notice Distinct order ids a taker has filled.
+    /// @param  taker The taker to query.
+    /// @return The deduped set of order ids the taker has filled.
+    function getTakerFills(address taker) external view returns (uint256[] memory) {
+        return _takerFills[taker].values();
+    }
+
+    /// @notice Read a publish record (e.g. to know what seq/handle to publish or
+    ///         whether a bond is recoverable).
+    /// @param  orderId   The order the record belongs to.
+    /// @param  seq       The record's seq.
+    /// @return handle    The encrypted bracket snapshot handle.
+    /// @return depositor The address that posted the record.
+    /// @return bondWei   The bond held, in wei (0 for maker records).
+    /// @return deadline  The depositor-exclusive window end (0 for maker records).
+    /// @return settled   Whether the bond has been settled.
+    function getPublish(
+        uint256 orderId,
+        uint64 seq
+    ) external view returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled) {
+        Publish storage p = _publishes[orderId][seq];
+        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Builds the {OrderView} projection, sourcing the frontier bracket
+    ///      handle from the latest publish record.
+    /// @param  orderId The order to project.
+    /// @return The flattened view of the order.
+    function _view(uint256 orderId) internal view returns (OrderView memory) {
+        Order storage o = orders[orderId];
+        return
+            OrderView({
+                maker: o.maker,
+                inputToken: address(o.inputToken),
+                outputToken: address(o.outputToken),
+                price: o.price,
+                expiry: o.expiry,
+                bracket: o.bracket,
+                latestSeq: o.latestSeq,
+                publishedSeq: o.publishedSeq,
+                bracketHandle: euint8.unwrap(_publishes[orderId][o.latestSeq].handle),
+                remainingHandle: euint64.unwrap(o.eRemaining),
+                depositedHandle: euint64.unwrap(o.eDepositedAmount),
+                active: o.active,
+                pending: o.pending,
+                closed: o.closed
+            });
+    }
+
+    /// @dev keccak of the directional token pair, the pair-index key.
+    /// @param  inputToken  The escrowed leg.
+    /// @param  outputToken The requested leg.
+    /// @return The directional pair key.
+    function _pairKey(address inputToken, address outputToken) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(inputToken, outputToken));
+    }
+
+    /// @dev Sends ETH via call; reverts on failure. No-op for zero amount.
+    /// @param to     The recipient.
+    /// @param amount The wei to send.
+    function _payEth(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok, ) = payable(to).call{ value: amount }('');
+        if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Converts an encrypted input amount to its USD-equivalent for
+    ///      bracket computation. Three cases, in priority order:
+    ///
+    ///   1. inputToken == fUSD  → identity (already in USD).
+    ///   2. outputToken == fUSD → use the maker's order price (Q44.20).
+    ///   3. cANY<>cANY          → use the inputToken oracle price (Q44.20).
+    ///
+    ///      An overflow cap (same pattern as fillOrder) ensures eAmount × price
+    ///      never wraps uint64. For large whale orders the cap still resolves to
+    ///      WHALE — brackets are indicators, not exact values.
+    /// @param  eAmount The encrypted input-token amount to value.
+    /// @param  o       The order whose legs/price select the conversion path.
+    /// @return The encrypted USD-equivalent (6-decimal fUSD units).
+    function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
+        if (address(o.inputToken) == address(fUSD)) return eAmount;
+
+        uint64 convPrice =
+            (address(o.outputToken) == address(fUSD)) ? o.price : _tokenConfig[address(o.inputToken)].oraclePrice;
+
+        uint64 maxSafe = type(uint64).max / convPrice;
+        euint64 eSafe = FHE.min(eAmount, FHE.asEuint64(maxSafe));
+        FHE.allowThis(eSafe);
+        euint64 eRaw = FHE.mul(eSafe, FHE.asEuint64(convPrice));
+        FHE.allowThis(eRaw);
+        euint64 eUSD = FHE.shr(eRaw, _E_SHR_20);
+        FHE.allowThis(eUSD);
+        return eUSD;
+    }
+
+    /// @dev Computes the size bracket from an encrypted fUSD amount using FHE
+    ///      comparisons and grants the necessary ACL permissions on the result.
+    ///      Built with nested FHE.select calls from largest threshold to
+    ///      smallest: start at WHALE and peel back each time the amount is
+    ///      below the next threshold, finally collapsing exact-zero to EMPTY.
+    ///      The result is allowPublic'd so the threshold network can decrypt it
+    ///      for a later publishBracket proof.
+    /// @param  usdAmount The encrypted USD-equivalent size (6-decimal fUSD units).
+    /// @return The encrypted bracket label (0–5), allowThis'd and allowPublic'd.
+    function _computeBracket(euint64 usdAmount) internal returns (euint8) {
+        ebool isZero = FHE.eq(usdAmount, _E_ZERO64);
+        ebool ltNano = FHE.lt(usdAmount, _NANO_MAX);
+        ebool ltSmall = FHE.lt(usdAmount, _SMALL_MAX);
+        ebool ltMedium = FHE.lt(usdAmount, _MEDIUM_MAX);
+        ebool ltLarge = FHE.lt(usdAmount, _LARGE_MAX);
+
+        euint8 b = FHE.select(ltLarge, _E_BRACKET_LARGE, _E_BRACKET_WHALE);
+        b = FHE.select(ltMedium, _E_BRACKET_MEDIUM, b);
+        b = FHE.select(ltSmall, _E_BRACKET_SMALL, b);
+        b = FHE.select(ltNano, _E_BRACKET_NANO, b);
+        b = FHE.select(isZero, _E_BRACKET_EMPTY, b);
+        FHE.allowThis(b);
+        FHE.allowPublic(b);
+        return b;
+    }
+}

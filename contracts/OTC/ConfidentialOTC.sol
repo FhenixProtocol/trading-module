@@ -141,6 +141,36 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 ///   eRemaining     -= eRelease
 ///   → snapshot the post-fill bracket into a Publish record (seq), post ETH bond
 ///
+/// ──────────────────────────────────────────────────────────────────────────
+/// Protocol swap fee
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// A Q44.20 fee (`swapFeeQ20`, 0 at deploy, owner-settable up to
+/// MAX_SWAP_FEE_Q20 ≈ 1%) is skimmed from the taker out of the input released
+/// by a fill:
+///
+///   eFee     = eRelease × swapFeeQ20 >> 20
+///   eToTaker = eRelease − eFee                 // sent to the taker
+///   eRemaining -= eRelease                     // fee-inclusive; maker sold it all
+///
+/// Charging on the input leg is what makes the fee nearly free: that input is
+/// already escrowed here, so the fee is booked into an encrypted per-token
+/// accrual (`_feesAccrued`) with no extra confidential transfer. Charging the
+/// output leg instead would force the taker→maker payment through this contract
+/// and add a second transfer to every fill. `eRemaining` still moves by the full
+/// `eRelease`, so no bracket path is affected by fees.
+///
+/// The rate is kept in BOTH plaintext (`swapFeeQ20`) and ciphertext
+/// (`_eSwapFeeQ20`). The ciphertext is cached so a fill loads a handle rather
+/// than paying for a fresh trivial encryption, and is `allowPublic`'d so anyone
+/// may read the live fee. The plaintext mirror is not redundant: the fee is
+/// public policy, and it is the only way to derive the overflow cap and to take
+/// the zero-fee fast path — you cannot branch on a ciphertext.
+///
+/// Accrued fees are swept by the owner via `collectFees(token)` to `treasury`.
+///
+/// ──────────────────────────────────────────────────────────────────────────
+///
 /// FHERC20 transfers are all-or-nothing: if the taker cannot cover the full
 /// `eOutput`, the payment moves 0 and `eOutputPaid != eOutput`, so `eRelease`
 /// is 0 and the escrow is untouched. This prevents a taker from draining input
@@ -187,6 +217,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
     /// @dev Basis-point denominator for the publish bounty split.
     uint256 public constant BPS_DENOM = 10_000;
+
+    /// @dev Hard ceiling on the protocol swap fee, in Q44.20 (10_486 ≈ 1.00%).
+    ///      Realistic OTC taker fees sit at 0.05–0.30%, so this leaves ample
+    ///      headroom while bounding how far governance can move the fee against
+    ///      takers. It also keeps the `eRelease × fee` overflow bound (see
+    ///      {_fillCap}) around 1.76e15 raw units (~$1.76bn at 6 decimals).
+    uint64 public constant MAX_SWAP_FEE_Q20 = 10_486;
 
     /// @dev seq assigned to the create record. Fills and top-ups increment from
     ///      here, so the create record is always the first and is published by
@@ -277,6 +314,35 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Depositor-exclusive grace window for fill publishes, in seconds.
     ///         Default 10 minutes.
     uint64 public windowSeconds = 600;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Protocol swap fee
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Protocol swap fee, Q44.20 (fraction of the released input skimmed
+    ///         from the taker). 0 = disabled, which is the deployed default.
+    /// @dev    Deliberately plaintext: the fee is public policy, and a plaintext
+    ///         mirror buys two things an `euint64` cannot. It lets {_fillCap}
+    ///         derive the overflow bound without a decryption, and it lets
+    ///         {_takeFee} branch — you cannot branch on an encrypted value, so
+    ///         without this mirror a zero fee would still pay for the full FHE
+    ///         mul/shr/sub/add on every fill.
+    uint64 public swapFeeQ20;
+
+    /// @dev Encrypted mirror of {swapFeeQ20}, cached so each fill loads a handle
+    ///      from storage instead of paying for a fresh `FHE.asEuint64` trivial
+    ///      encryption. Re-derived (and re-ACL'd) only when the fee changes.
+    ///      `allowPublic`'d, so anyone may read or decrypt the current fee.
+    euint64 private _eSwapFeeQ20;
+
+    /// @notice Destination for swept protocol fees. Defaults to the deployer.
+    address public treasury;
+
+    /// @dev Encrypted fees accrued per token, awaiting a {collectFees} sweep.
+    ///      Fees are skimmed from input already sitting in escrow, so the
+    ///      tokens are present without any extra transfer. An unset slot is the
+    ///      zero handle, which `FHE.add` treats as encrypted zero.
+    mapping(address => euint64) private _feesAccrued;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -481,6 +547,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  orderId The delisted order.
     event OrderDelisted(uint256 indexed orderId);
 
+    /// @notice The protocol swap fee was changed.
+    /// @param  swapFeeQ20 The new Q44.20 fee (0 = disabled).
+    event SwapFeeUpdated(uint64 swapFeeQ20);
+
+    /// @notice The fee sweep destination was changed.
+    /// @param  treasury The new treasury address.
+    event TreasuryUpdated(address indexed treasury);
+
+    /// @notice Accrued fees for a token were swept to the treasury.
+    /// @param  token    The token swept.
+    /// @param  to       The treasury address that received them.
+    /// @param  eAmount  Encrypted amount actually transferred (readable by the
+    ///                  treasury and this contract).
+    event FeesCollected(address indexed token, address indexed to, euint64 eAmount);
+
     // ─────────────────────────────────────────────────────────────────────────
     // Errors
     // ─────────────────────────────────────────────────────────────────────────
@@ -524,6 +605,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error NotInWindow();
     /// @notice A native ETH transfer (refund / bounty) failed.
     error EthTransferFailed();
+    /// @notice The requested swap fee exceeds MAX_SWAP_FEE_Q20.
+    error FeeTooHigh();
+    /// @notice No fees have accrued for the token being swept.
+    error NoFeesAccrued();
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -578,6 +663,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(_LARGE_MAX);
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
+
+        treasury = msg.sender;
+        emit TreasuryUpdated(msg.sender);
+        _setSwapFee(0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -664,6 +753,98 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @return The token's {TokenConfig} (whitelisted flag, oracle price, timestamp).
     function getTokenConfig(address token) external view returns (TokenConfig memory) {
         return _tokenConfig[token];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Admin: protocol swap fee
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Set the protocol swap fee. Owner only.
+    ///
+    /// @dev    Takes a **plaintext** rate on purpose. The fee is public policy,
+    ///         not a secret: publishing it lets takers price a fill before
+    ///         sending it, and it is what allows the zero-fee fast path in
+    ///         {_takeFee}. The encrypted mirror is re-derived here — once per
+    ///         change rather than once per fill.
+    ///
+    ///         Applies immediately to every subsequent fill, including fills of
+    ///         orders created under an older rate. That is safe because the fee
+    ///         falls on the taker, who observes the current rate at fill time;
+    ///         a maker-borne fee would instead need a per-order snapshot.
+    ///
+    /// @param  feeQ20 The new Q44.20 fee (0 disables; must be ≤ MAX_SWAP_FEE_Q20).
+    function setSwapFee(uint64 feeQ20) external onlyOwner {
+        _setSwapFee(feeQ20);
+    }
+
+    /// @dev Shared fee-setting path for the constructor and {setSwapFee}.
+    ///      Persists the ACL on the new handle (`allowThis` so it stays a valid
+    ///      operand across transactions, `allowPublic` so anyone may read and
+    ///      decrypt the live rate).
+    /// @param feeQ20 The new Q44.20 fee.
+    function _setSwapFee(uint64 feeQ20) internal {
+        if (feeQ20 > MAX_SWAP_FEE_Q20) revert FeeTooHigh();
+        swapFeeQ20 = feeQ20;
+        euint64 eFee = FHE.asEuint64(feeQ20);
+        FHE.allowThis(eFee);
+        FHE.allowPublic(eFee);
+        _eSwapFeeQ20 = eFee;
+        emit SwapFeeUpdated(feeQ20);
+    }
+
+    /// @notice Set the destination for {collectFees} sweeps. Owner only.
+    /// @param  treasury_ The new treasury address (non-zero).
+    function setTreasury(address treasury_) external onlyOwner {
+        if (treasury_ == address(0)) revert ZeroAddress();
+        treasury = treasury_;
+        emit TreasuryUpdated(treasury_);
+    }
+
+    /// @notice Sweep all fees accrued in `token` to the {treasury}. Owner only.
+    ///
+    /// @dev    Zeroes the accrual before transferring, so fills landing after
+    ///         this call accumulate into a fresh balance that a later sweep
+    ///         collects. Never touches live escrow: the contract's balance of
+    ///         `token` is the sum of open orders' `eRemaining` plus accrued
+    ///         fees, and each fee was carved out of input that had already been
+    ///         debited from an order's `eRemaining`.
+    /// @param  token      The token to sweep.
+    /// @return eCollected The encrypted amount actually transferred.
+    function collectFees(address token) external onlyOwner nonReentrant returns (euint64 eCollected) {
+        euint64 accrued = _feesAccrued[token];
+        if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
+        _feesAccrued[token] = euint64.wrap(0);
+
+        FHE.allow(accrued, token);
+        address to = treasury;
+        eCollected = IFHERC20(token).confidentialTransfer(to, accrued);
+
+        FHE.allowThis(eCollected);
+        FHE.allow(eCollected, to);
+
+        emit FeesCollected(token, to, eCollected);
+    }
+
+    /// @notice Encrypted handle of the fees accrued for a token.
+    ///
+    /// @dev    Returns the ciphertext *handle*, not the amount — decryption is
+    ///         gated by the CoFHE ACL, and this accrual is only ever
+    ///         `allowThis`'d, so no external account can read it. The treasury
+    ///         learns the figure at sweep time instead: {collectFees} grants it
+    ///         ACL on the transferred total and emits it in {FeesCollected}.
+    ///         A zero handle means nothing has accrued since the last sweep.
+    /// @param  token The token to query.
+    /// @return The `euint64` handle of the accrued balance.
+    function feesAccrued(address token) external view returns (bytes32) {
+        return euint64.unwrap(_feesAccrued[token]);
+    }
+
+    /// @notice Encrypted handle of the live swap fee.
+    /// @dev    `allowPublic`'d, so any caller may decrypt it. {swapFeeQ20}
+    ///         exposes the same value in plaintext and is cheaper to read.
+    /// @return The `euint64` handle of the current Q44.20 fee.
+    function swapFeeHandle() external view returns (bytes32) {
+        return euint64.unwrap(_eSwapFeeQ20);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -915,9 +1096,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param encTokensWanted The taker's encrypted requested input amount.
     function _swap(Order storage o, InEuint64 calldata encTokensWanted) internal {
         // Cap requested amount at available remaining and the overflow bound.
-        // FHE.mul below is mod 2^64; cap so eActual × price never wraps.
+        // FHE.mul below is mod 2^64; cap so neither eActual × price nor the
+        // downstream eRelease × fee ever wraps.
         euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted), o.eRemaining);
-        eActual = FHE.min(eActual, FHE.asEuint64(type(uint64).max / o.price));
+        eActual = FHE.min(eActual, FHE.asEuint64(_fillCap(o.price)));
         FHE.allowThis(eActual);
 
         // Output cost via Q44.20 price: eActual × price >> 20.
@@ -937,15 +1119,68 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         );
         FHE.allowThis(eRelease);
 
-        // Send released input from OTC escrow to taker.
-        FHE.allow(eRelease, address(o.inputToken));
-        FHE.allow(eRelease, msg.sender); // taker can verify receipt
-        o.inputToken.confidentialTransfer(msg.sender, eRelease);
+        // Skim the protocol fee off the released input before it leaves escrow.
+        // The fee never moves: it is already held here, so this costs no extra
+        // token transfer. When the fee is 0 this is a plaintext no-op.
+        euint64 eToTaker = _takeFee(address(o.inputToken), eRelease);
 
-        // Decrement remaining.
+        // Send the taker's share of the released input from OTC escrow.
+        FHE.allow(eToTaker, address(o.inputToken));
+        FHE.allow(eToTaker, msg.sender); // taker can verify receipt
+        o.inputToken.confidentialTransfer(msg.sender, eToTaker);
+
+        // Decrement remaining by the FULL release, fee included — the maker sold
+        // that much. Keeping this on eRelease leaves every bracket path
+        // (_toUSD, _computeBracket, the seq/frontier rules) untouched by fees.
         o.eRemaining = FHE.sub(o.eRemaining, eRelease);
         FHE.allowThis(o.eRemaining);
         FHE.allow(o.eRemaining, o.maker); // maker can track their position
+    }
+
+    /// @dev Skims the protocol fee out of a released input amount and books it
+    ///      against `token`'s accrual, returning what is left for the taker.
+    ///
+    ///      Fee = eRelease × swapFeeQ20 >> 20 (the contract's existing Q44.20
+    ///      idiom — a mul and a shr, avoiding the far heavier FHE.div a
+    ///      basis-point denominator would need). Because fee ≤ 1 (Q44.20), the
+    ///      subtraction can never underflow, and a failed fill has eRelease = 0
+    ///      so it accrues nothing without any special casing.
+    ///
+    ///      The `feeQ20 == 0` fast path is why {swapFeeQ20} is mirrored in
+    ///      plaintext: you cannot branch on a ciphertext, so with the fee
+    ///      disabled every fill would otherwise still pay for four FHE ops.
+    /// @param  token     The input token the fee is denominated in.
+    /// @param  eRelease  The encrypted input released by the fill.
+    /// @return eToTaker  The encrypted remainder owed to the taker.
+    function _takeFee(address token, euint64 eRelease) internal returns (euint64 eToTaker) {
+        uint64 feeQ20 = swapFeeQ20;
+        if (feeQ20 == 0) return eRelease;
+
+        euint64 eFee = FHE.shr(FHE.mul(eRelease, _eSwapFeeQ20), _E_SHR_20);
+        FHE.allowThis(eFee);
+
+        euint64 accrued = FHE.add(_feesAccrued[token], eFee);
+        FHE.allowThis(accrued);
+        _feesAccrued[token] = accrued;
+
+        eToTaker = FHE.sub(eRelease, eFee);
+        FHE.allowThis(eToTaker);
+    }
+
+    /// @dev The plaintext ceiling a fill's input amount is clamped to, so no
+    ///      downstream FHE multiply wraps uint64. Two bounds, whichever binds:
+    ///      the Q44.20 price multiply in {_swap}, and the fee multiply in
+    ///      {_takeFee}. At MAX_SWAP_FEE_Q20 the fee bound is ~1.76e15, so it
+    ///      only becomes the tighter of the two at very low prices.
+    /// @param  price The order's Q44.20 price.
+    /// @return cap   The maximum input amount safe to process.
+    function _fillCap(uint64 price) internal view returns (uint64 cap) {
+        cap = type(uint64).max / price;
+        uint64 feeQ20 = swapFeeQ20;
+        if (feeQ20 > 1) {
+            uint64 feeCap = type(uint64).max / feeQ20;
+            if (feeCap < cap) cap = feeCap;
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

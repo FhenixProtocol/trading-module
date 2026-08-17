@@ -1248,4 +1248,275 @@ describe("ConfidentialOTC", () => {
       expect(order.closed).to.equal(true);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // protocol swap fee
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("protocol swap fee", () => {
+    const FEE_030 = 3_146n; // 0.30% in Q44.20
+    const MAX_FEE = 10_486n; // MAX_SWAP_FEE_Q20 (~1.00%)
+    const MAXU64 = (1n << 64n) - 1n;
+    const ZERO_HANDLE = "0x" + "0".repeat(64);
+
+    /// Mirrors the contract's Q44.20 skim: eRelease × feeQ20 >> 20.
+    const feeOf = (amount: bigint, feeQ20: bigint) => (amount * feeQ20) >> 20n;
+
+    /// Mirrors _fillCap: the tighter of the price and fee overflow bounds.
+    const fillCap = (price: bigint, feeQ20: bigint) => {
+      let cap = MAXU64 / price;
+      if (feeQ20 > 1n) {
+        const feeCap = MAXU64 / feeQ20;
+        if (feeCap < cap) cap = feeCap;
+      }
+      return cap;
+    };
+
+    /// Maker alice posts 1 mBTC of ecBTC for fUSD; bob funded to take it.
+    async function withOrder(feeQ20: bigint) {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      if (feeQ20 > 0n) {
+        await (await otc.connect(deployer).setSwapFee(feeQ20)).wait();
+      }
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        await enc(aliceClient, mBTC),
+      );
+      return { ...ctx, id };
+    }
+
+    it("is disabled at deploy and leaves the fill path byte-for-byte unchanged", async () => {
+      const { bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
+
+      expect(await otc.swapFeeQ20()).to.equal(0n);
+      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Identical to the zero-fee expectations in the fillOrder suite.
+      await expectBalance(ecbtc, bob.address, mBTC);
+      await expectBalance(ecbtc, otcAddr, 0n);
+      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
+      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
+    });
+
+    it("skims the fee from the taker and retains it in escrow", async () => {
+      const { alice, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee = feeOf(mBTC, FEE_030); // 1_000 raw @ 0.30% → 3 raw
+      expect(fee).to.equal(3n);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expectBalance(ecbtc, bob.address, mBTC - fee); // taker short by the fee
+      await expectBalance(ecbtc, otcAddr, fee); // fee stays put — no extra transfer
+      await expectBalance(fusd, alice.address, FILL_1MBTC_FUSD); // maker paid in full
+      expect(await otc.feesAccrued(ecbtcAddr)).to.not.equal(ZERO_HANDLE);
+    });
+
+    it("decrements eRemaining by the full release, so the bracket is unaffected", async () => {
+      const { bob, otc, bobClient, ecbtcAddr, fusdAddr, id } = await withOrder(FEE_030);
+
+      // Order is fully consumed even though the taker received less than the
+      // release: eRemaining moves by eRelease, not eToTaker.
+      const value = await fillAndPublish(otc, bob, bobClient, id, mBTC);
+      expect(value).to.equal(EMPTY);
+
+      const order = await otc.getOrder(id);
+      expect(order.bracket).to.equal(EMPTY);
+      expect(order.active).to.equal(false);
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+    });
+
+    it("accrues across multiple fills", async () => {
+      const { bob, ecbtc, otc, bobClient, otcAddr, id } = await withOrder(FEE_030);
+
+      const fee1 = feeOf(400n, FEE_030);
+      const fee2 = feeOf(200n, FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await expectBalance(ecbtc, bob.address, 400n - fee1);
+
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await expectBalance(ecbtc, bob.address, 400n - fee1 + (200n - fee2));
+
+      // Escrow holds the untouched remainder plus both accrued fees.
+      await expectBalance(ecbtc, otcAddr, mBTC - 400n - 200n + fee1 + fee2);
+    });
+
+    it("charges nothing when the taker fails to pay in full", async () => {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await (await otc.connect(deployer).setSwapFee(FEE_030)).wait();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      // Bob cannot cover $65 — the release is 0, so the fee must also be 0.
+      await (await fusd.mint(bob.address, 1n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        await enc(aliceClient, mBTC),
+      );
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expectBalance(ecbtc, bob.address, 0n);
+      await expectBalance(ecbtc, otcAddr, mBTC); // escrow intact, nothing skimmed
+      await hre.cofhe.mocks.expectPlaintext(await otc.feesAccrued(ecbtcAddr), 0n);
+    });
+
+    it("clamps the fill so eRelease × fee cannot wrap uint64", async () => {
+      // price < swapFeeQ20 is the regime where the fee bound is the tighter of
+      // the two caps. At price=100 the old price-only cap was 1.84e17, and
+      // 1.84e17 × 10486 overflows uint64 — the fee bound is what prevents it.
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      const price = 100n;
+      expect(price).to.be.lessThan(MAX_FEE); // fee bound binds
+      await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
+
+      const cap = fillCap(price, MAX_FEE);
+      const deposit = cap + 10n ** 12n; // more than the cap, so it must clamp
+      const output = (cap * price) >> 20n;
+
+      await (await ecbtc.mint(alice.address, deposit)).wait();
+      await (await ecbtc.connect(alice).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await (await fusd.mint(bob.address, output)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        price,
+        0n,
+        await enc(aliceClient, deposit),
+      );
+
+      await fill(otc, bob, bobClient, id, deposit); // request everything
+
+      // eActual clamped to the fee bound; the fee is a sane ~1%, not a wrapped
+      // value, and the taker's receipt plus the retained fee reconstruct it.
+      const fee = feeOf(cap, MAX_FEE);
+      expect(fee).to.be.greaterThan(0n);
+      expect(fee).to.be.lessThan(cap);
+      await expectBalance(ecbtc, bob.address, cap - fee);
+      await expectBalance(ecbtc, otcAddr, deposit - cap + fee);
+    });
+
+    // ── admin surface ─────────────────────────────────────────────────────
+
+    it("only the owner may set the fee, and only up to MAX_SWAP_FEE_Q20", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      expect(await otc.MAX_SWAP_FEE_Q20()).to.equal(MAX_FEE);
+
+      await expect(otc.connect(alice).setSwapFee(FEE_030)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(otc.connect(deployer).setSwapFee(MAX_FEE + 1n)).to.be.revertedWithCustomError(otc, "FeeTooHigh");
+
+      await expect(otc.connect(deployer).setSwapFee(FEE_030)).to.emit(otc, "SwapFeeUpdated").withArgs(FEE_030);
+      expect(await otc.swapFeeQ20()).to.equal(FEE_030);
+
+      // The ceiling itself is allowed, and the fee can be switched back off.
+      await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
+      expect(await otc.swapFeeQ20()).to.equal(MAX_FEE);
+      await (await otc.connect(deployer).setSwapFee(0n)).wait();
+      expect(await otc.swapFeeQ20()).to.equal(0n);
+    });
+
+    it("publishes the fee handle so any account can read the live rate", async () => {
+      const { deployer, otc, bobClient } = await setup();
+
+      await (await otc.connect(deployer).setSwapFee(FEE_030)).wait();
+
+      // bob is unrelated to the fee, yet allowPublic lets him decrypt it.
+      const dec = await proof(bobClient, await otc.swapFeeHandle());
+      expect(BigInt(dec.decryptedValue)).to.equal(FEE_030);
+    });
+
+    it("defaults the treasury to the deployer and guards setTreasury", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      expect(await otc.treasury()).to.equal(deployer.address);
+
+      await expect(otc.connect(alice).setTreasury(alice.address)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(otc.connect(deployer).setTreasury(ethers.ZeroAddress)).to.be.revertedWithCustomError(
+        otc,
+        "ZeroAddress",
+      );
+
+      await expect(otc.connect(deployer).setTreasury(alice.address))
+        .to.emit(otc, "TreasuryUpdated")
+        .withArgs(alice.address);
+      expect(await otc.treasury()).to.equal(alice.address);
+    });
+
+    // ── collection ────────────────────────────────────────────────────────
+
+    it("sweeps accrued fees to the treasury and cannot double-sweep", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      // Nothing accrued yet.
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+
+      const fee = feeOf(mBTC, FEE_030);
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Route the sweep to a signer holding no ecBTC — proves the destination
+      // follows `treasury` rather than the caller, and keeps the assertion exact
+      // (alice the maker, and bob the taker, both carry ecBTC of their own).
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
+      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
+
+      // The slot is reset to the zero handle, so the guard fires again — this
+      // is what would break if it were cleared with FHE.asEuint64(0).
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+    });
+
+    it("only the owner may sweep", async () => {
+      const { alice, bob, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expect(otc.connect(alice).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+    });
+  });
 });

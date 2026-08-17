@@ -1508,6 +1508,65 @@ describe("ConfidentialOTC", () => {
       await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
+    it("throttles sweeps to once per COLLECT_COOLDOWN, defeating the sandwich", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const cooldown = await otc.COLLECT_COOLDOWN();
+      expect(cooldown).to.equal(86_400n);
+
+      // First sweep is never blocked — no prior collection to wait on.
+      expect(await otc.lastCollectAt(ecbtcAddr)).to.equal(0n);
+      expect(await otc.collectUnlockAt(ecbtcAddr)).to.equal(0n);
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+
+      const last = await otc.lastCollectAt(ecbtcAddr);
+      expect(last).to.be.greaterThan(0n);
+      expect(await otc.collectUnlockAt(ecbtcAddr)).to.equal(last + cooldown);
+
+      // The sandwich: a second fill lands, and the owner tries to collect again
+      // straight away to isolate that single fill's fee. Blocked.
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+
+      const unlock = Number(await otc.collectUnlockAt(ecbtcAddr));
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock - 1]);
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock]);
+      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+    });
+
+    it("allows the next sweep once the cooldown elapses, aggregating the interim fills", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee1 = feeOf(400n, FEE_030);
+      const fee2 = feeOf(200n, FEE_030);
+      const fee3 = feeOf(100n, FEE_030);
+
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+      await expectBalance(ecbtc, carol.address, fee1);
+
+      // Two more fills accrue while the sweep is locked.
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await fillAndPublish(otc, bob, bobClient, id, 100n);
+
+      await hre.network.provider.send("evm_increaseTime", [86_400]);
+      await hre.network.provider.send("evm_mine");
+
+      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+
+      // The disclosed total is the SUM of both interim fills, not either alone.
+      await expectBalance(ecbtc, carol.address, fee1 + fee2 + fee3);
+      await expectBalance(ecbtc, otcAddr, mBTC - 400n - 200n - 100n);
+    });
+
     it("only the owner may sweep", async () => {
       const { alice, bob, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
 

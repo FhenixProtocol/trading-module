@@ -167,7 +167,10 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 /// public policy, and it is the only way to derive the overflow cap and to take
 /// the zero-fee fast path — you cannot branch on a ciphertext.
 ///
-/// Accrued fees are swept by the owner via `collectFees(token)` to `treasury`.
+/// Accrued fees are swept by the owner via `collectFees(token)` to `treasury`,
+/// at most once per COLLECT_COOLDOWN (24h) per token. A sweep discloses its own
+/// size to the treasury, so throttling it stops the owner from bracketing a
+/// single fill to back out that taker's exact amount from the public fee rate.
 ///
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -224,6 +227,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///      takers. It also keeps the `eRelease × fee` overflow bound (see
     ///      {_fillCap}) around 1.76e15 raw units (~$1.76bn at 6 decimals).
     uint64 public constant MAX_SWAP_FEE_Q20 = 10_486;
+
+    /// @dev Minimum interval between fee sweeps of the same token. Deliberately
+    ///      a constant: it exists to constrain the owner, so an owner-settable
+    ///      version would defeat itself. See {collectFees}.
+    uint64 public constant COLLECT_COOLDOWN = 24 hours;
 
     /// @dev seq assigned to the create record. Fills and top-ups increment from
     ///      here, so the create record is always the first and is published by
@@ -343,6 +351,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///      tokens are present without any extra transfer. An unset slot is the
     ///      zero handle, which `FHE.add` treats as encrypted zero.
     mapping(address => euint64) private _feesAccrued;
+
+    /// @dev Last {collectFees} timestamp per token, enforcing COLLECT_COOLDOWN.
+    ///      0 means never swept, which never blocks the first sweep.
+    mapping(address => uint64) private _lastCollectAt;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -609,6 +621,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error FeeTooHigh();
     /// @notice No fees have accrued for the token being swept.
     error NoFeesAccrued();
+    /// @notice A fee sweep was attempted before COLLECT_COOLDOWN elapsed.
+    error CollectTooSoon();
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -808,12 +822,25 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         `token` is the sum of open orders' `eRemaining` plus accrued
     ///         fees, and each fee was carved out of input that had already been
     ///         debited from an order's `eRemaining`.
+    ///         Rate-limited to once per COLLECT_COOLDOWN per token. A sweep
+    ///         always discloses its own size — the treasury can decrypt its own
+    ///         balance whatever ACL is set here — so an unthrottled sweep would
+    ///         let the owner bracket a single fill (collect, wait for one fill,
+    ///         collect) and read its fee. The rate is public, so that recovers
+    ///         the taker's exact amount. The cooldown forces each disclosed
+    ///         total to aggregate a day of fills. It is a hard constant, not a
+    ///         governable one, since the owner is the party it constrains.
     /// @param  token      The token to sweep.
     /// @return eCollected The encrypted amount actually transferred.
     function collectFees(address token) external onlyOwner nonReentrant returns (euint64 eCollected) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
+
+        uint64 last = _lastCollectAt[token];
+        if (last != 0 && block.timestamp < last + COLLECT_COOLDOWN) revert CollectTooSoon();
+
         _feesAccrued[token] = euint64.wrap(0);
+        _lastCollectAt[token] = uint64(block.timestamp);
 
         FHE.allow(accrued, token);
         address to = treasury;
@@ -823,6 +850,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allow(eCollected, to);
 
         emit FeesCollected(token, to, eCollected);
+    }
+
+    /// @notice Timestamp of the last fee sweep for a token (0 if never swept).
+    /// @param  token The token to query.
+    /// @return The last sweep timestamp.
+    function lastCollectAt(address token) external view returns (uint64) {
+        return _lastCollectAt[token];
+    }
+
+    /// @notice Earliest timestamp at which `token` may next be swept.
+    /// @param  token The token to query.
+    /// @return The unlock timestamp (0 when the token has never been swept).
+    function collectUnlockAt(address token) external view returns (uint64) {
+        uint64 last = _lastCollectAt[token];
+        return last == 0 ? 0 : last + COLLECT_COOLDOWN;
     }
 
     /// @notice Encrypted handle of the fees accrued for a token.

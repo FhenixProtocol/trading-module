@@ -6,6 +6,7 @@ import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import { FHE, euint64, euint8, ebool, InEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
 import { IFHERC20 } from '../interfaces/IFHERC20.sol';
+import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 
 /// @title  ConfidentialOTC
 /// @author Rogue Rotkosky, Fhenix
@@ -261,6 +262,25 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         before any bonded action whose USD size is non-zero.
     uint64 public ethOraclePrice;
 
+    /// @notice Timestamp of the last {setEthOraclePrice}. 0 while unset.
+    /// @dev    The companion `TokenConfig.priceUpdatedAt` already existed for the
+    ///         cosmetic per-token feed; this mirrors it for the feed that
+    ///         actually sizes funds, so bond pricing can detect "configured but
+    ///         stale" rather than only "never configured". Only consulted on the
+    ///         fallback path — when {ethUsdFeed} is set, Chainlink's own
+    ///         `updatedAt` is the staleness clock.
+    uint64 public ethPriceUpdatedAt;
+
+    /// @notice Chainlink ETH/USD feed. When set it is the authoritative source
+    ///         for bond sizing and {ethOraclePrice} is ignored. Zero address
+    ///         falls back to the pushed price.
+    /// @dev    Only the bond path reads a feed. Per-token *bracket* prices stay
+    ///         pushed: the whitelisted set is confidential wrappers with no
+    ///         canonical feeds, and brackets are decade-wide buckets where a
+    ///         ~15k-gas external read on an already FHE-heavy path buys nothing.
+    AggregatorV3Interface public ethUsdFeed;
+
+
     // ─────────────────────────────────────────────────────────────────────────
     // Governable bond / window parameters
     // ─────────────────────────────────────────────────────────────────────────
@@ -277,6 +297,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Depositor-exclusive grace window for fill publishes, in seconds.
     ///         Default 10 minutes.
     uint64 public windowSeconds = 600;
+
+    /// @notice Maximum age an oracle price may reach before it counts as stale.
+    ///         Default 2 days. 0 disables staleness checks entirely.
+    /// @dev    Enforced as a hard revert only on the ETH/bond path ({_usdToWei}),
+    ///         where a drifting price mis-sizes real funds. For per-token bracket
+    ///         prices it is advisory — see {isPriceStale} — because brackets are
+    ///         decade-wide buckets and reverting fills over a slightly old price
+    ///         would strand orders for no safety gain.
+    uint64 public maxPriceAge = 2 days;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -417,6 +446,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  oraclePrice The new Q44.20 USD-per-ETH price.
     event EthOraclePriceUpdated(uint64 oraclePrice);
 
+    /// @notice The oracle staleness window was changed.
+    /// @param  maxPriceAge The new maximum price age in seconds (0 = disabled).
+    event MaxPriceAgeUpdated(uint64 maxPriceAge);
+
+    /// @notice The Chainlink ETH/USD feed used for bond sizing was changed.
+    /// @param  feed The new aggregator, or address(0) to fall back to the
+    ///              pushed `ethOraclePrice`.
+    event EthUsdFeedUpdated(address indexed feed);
+
     /// @notice The governable bond / window parameters were retuned.
     /// @param  fillBondUsd   New taker fill bond (6-decimal USD).
     /// @param  makerBondUsd  New maker bond (6-decimal USD).
@@ -514,6 +552,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error LengthMismatch();
     /// @notice A bonded action was attempted before `ethOraclePrice` was set.
     error EthOracleUnset();
+    /// @notice The Chainlink feed returned an answer that cannot be used as a
+    ///         divisor: non-positive, or out of Q44.20 range.
+    error BadOraclePrice();
     /// @notice msg.value did not cover the required bond, or bountyBps > BPS_DENOM.
     error WrongBond();
     /// @notice No publish record exists for the given (orderId, seq).
@@ -636,7 +677,71 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         if (msg.sender != oracle && msg.sender != owner()) revert Unauthorized();
         if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
         ethOraclePrice = price;
+        ethPriceUpdatedAt = uint64(block.timestamp);
         emit EthOraclePriceUpdated(price);
+    }
+
+    /// @notice Set the staleness window for oracle prices. Owner only.
+    /// @dev    Passing 0 disables staleness checks — an operational lever for
+    ///         oracle migrations. The owner can also simply push a fresh price,
+    ///         since {setEthOraclePrice} accepts the owner as well as the oracle.
+    /// @param  maxPriceAge_ The new maximum price age, in seconds (0 = disabled).
+    function setMaxPriceAge(uint64 maxPriceAge_) external onlyOwner {
+        maxPriceAge = maxPriceAge_;
+        emit MaxPriceAgeUpdated(maxPriceAge_);
+    }
+
+    /// @notice Point bond sizing at a Chainlink ETH/USD feed. Owner only.
+    ///
+    /// @dev    This is one-time *configuration*, not a price push: it records
+    ///         which aggregator to read. Once set, every {_usdToWei} — so every
+    ///         `fillOrder` and every bonded `createOrder` — reads the live
+    ///         answer straight from Chainlink. No keeper, no cron, no further
+    ///         owner involvement, and {ethOraclePrice} stops being consulted.
+    ///
+    ///         Pass address(0) to fall back to the pushed price (a deprecated
+    ///         feed, or a chain that has none).
+    ///
+    /// @param  feed The Chainlink aggregator, or address(0) to disable.
+    function setEthUsdFeed(AggregatorV3Interface feed) external onlyOwner {
+        ethUsdFeed = feed;
+        emit EthUsdFeedUpdated(address(feed));
+    }
+
+    /// @notice The ETH/USD price bond sizing will use right now, in Q44.20.
+    /// @return The Q44.20 USD-per-whole-ETH price.
+    function ethUsdPriceQ20() external view returns (uint64) {
+        return _ethUsdQ20();
+    }
+
+    /// @dev The ETH/USD price for bond sizing: the feed when configured, else
+    ///      the pushed price. The feed's own `decimals()` sets the scale, so any
+    ///      correctly-configured aggregator works without assumptions here.
+    ///
+    ///      Deliberately does NOT reject a stale price. This value sizes a
+    ///      *refundable* bond, so an old price costs a taker cents on a deposit
+    ///      they get straight back, whereas reverting would stop every fill on
+    ///      every pair. Halting the venue to avoid mis-sizing a $5 refundable
+    ///      deposit is the wrong way round. {isEthPriceStale} reports staleness
+    ///      for monitoring instead of enforcing it.
+    ///
+    ///      The two remaining checks are arithmetic safety, not price policy: a
+    ///      negative answer would overflow the cast, and a zero result would
+    ///      divide by zero in {_usdToWei}.
+    /// @return The Q44.20 USD-per-whole-ETH price.
+    function _ethUsdQ20() internal view returns (uint64) {
+        AggregatorV3Interface feed = ethUsdFeed;
+        if (address(feed) == address(0)) {
+            if (ethOraclePrice == 0) revert EthOracleUnset();
+            return ethOraclePrice;
+        }
+
+        (, int256 answer, , , ) = feed.latestRoundData();
+        if (answer <= 0) revert BadOraclePrice();
+
+        uint256 q20 = (uint256(answer) * Q_DENOM) / (10 ** feed.decimals());
+        if (q20 == 0 || q20 > type(uint64).max) revert BadOraclePrice();
+        return uint64(q20);
     }
 
     /// @notice Update the governable bond / window parameters. Owner only.
@@ -690,9 +795,54 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  usd6 The USD amount, scaled by 1e6.
     /// @return The equivalent wei (0 when `usd6` is 0).
     function _usdToWei(uint64 usd6) internal view returns (uint256) {
+        // Skipped entirely when the bond is 0, so a zero-bond configuration
+        // never needs a live price at all.
         if (usd6 == 0) return 0;
-        if (ethOraclePrice == 0) revert EthOracleUnset();
-        return (uint256(usd6) * 1e12 * Q_DENOM) / ethOraclePrice;
+        return (uint256(usd6) * 1e12 * Q_DENOM) / _ethUsdQ20();
+    }
+
+    /// @dev True when `updatedAt` is older than {maxPriceAge}. Always false when
+    ///      the window is 0 (checks disabled). Widened to uint256 so a large
+    ///      window cannot overflow the addition.
+    /// @param  updatedAt The timestamp to age-check.
+    /// @return Whether the value is considered stale.
+    function _isStale(uint256 updatedAt) internal view returns (bool) {
+        if (maxPriceAge == 0) return false;
+        return block.timestamp > updatedAt + uint256(maxPriceAge);
+    }
+
+    /// @notice Whether a whitelisted token's bracket price has gone stale.
+    /// @dev    Advisory only — {_toUSD} never reverts on this. Brackets are
+    ///         coarse buckets, so a slightly old price mis-sorts the book at
+    ///         worst;
+    ///         fUSD is never stale: it is the unit of account, pinned at $1.
+    /// @param  token The token to check.
+    /// @return True when the price is older than {maxPriceAge}.
+    function isPriceStale(address token) external view returns (bool) {
+        if (token == address(fUSD)) return false;
+        return _isStale(_tokenConfig[token].priceUpdatedAt);
+    }
+
+    /// @notice Seconds since a token's bracket price was last updated.
+    /// @param  token The token to check.
+    /// @return The age in seconds (0 if never set).
+    function priceAge(address token) external view returns (uint256) {
+        uint64 updatedAt = _tokenConfig[token].priceUpdatedAt;
+        return updatedAt == 0 ? 0 : block.timestamp - updatedAt;
+    }
+
+    /// @notice Whether the ETH/USD price used for bond sizing has gone stale.
+    /// @dev    Advisory, like {isPriceStale} — nothing reverts on it. Reads
+    ///         whichever source {_ethUsdQ20} would: the feed's own `updatedAt`
+    ///         when one is configured, otherwise {ethPriceUpdatedAt}. Reporting
+    ///         the pushed timestamp while a feed is in use would be wrong in
+    ///         both directions, so the branch matters.
+    /// @return True when that price is older than {maxPriceAge}.
+    function isEthPriceStale() external view returns (bool) {
+        AggregatorV3Interface feed = ethUsdFeed;
+        if (address(feed) == address(0)) return _isStale(ethPriceUpdatedAt);
+        (, , , uint256 updatedAt, ) = feed.latestRoundData();
+        return _isStale(updatedAt);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

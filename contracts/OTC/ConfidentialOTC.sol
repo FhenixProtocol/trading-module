@@ -4,7 +4,7 @@ pragma solidity ^0.8.27;
 import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
 import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
-import { FHE, euint64, euint8, ebool, InEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
+import { FHE, euint64, euint8, ebool, externalEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
 import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 
 /// @title  ConfidentialOTC
@@ -118,7 +118,8 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 ///                     $100   → 104_857_600
 ///   - expiry      : unix timestamp after which the order can no longer be
 ///                   filled. 0 = good-til-cancelled (never expires).
-///   - encAmount   : encrypted input token quantity (InEuint64).
+///   - encAmount   : encrypted input token quantity handle, with its `inputProof`
+///                   batch signature bound to this contract.
 ///
 /// All tokens are capped at 6 decimals (enforced at whitelist time); fUSD
 /// must use exactly 6 decimals (enforced in the constructor).
@@ -713,14 +714,16 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param price       Q44.20 rate: output per input, scaled by 2^20.
     /// @param expiry      Unix timestamp after which the order can no longer be
     ///                    filled. Pass 0 for good-til-cancelled.
-    /// @param encAmount   Encrypted input amount (InEuint64 signed for this contract).
+    /// @param encAmount   Encrypted input amount handle, signed for this contract.
+    /// @param inputProof  Batch signature covering `encAmount`, bound to this contract.
     /// @return orderId    The id assigned to the new (pending) order.
     function createOrder(
         IFHERC20 inputToken,
         IFHERC20 outputToken,
         uint64 price,
         uint64 expiry,
-        InEuint64 calldata encAmount
+        externalEuint64 encAmount,
+        bytes calldata inputProof
     ) external payable nonReentrant returns (uint256 orderId) {
         if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
         if (address(inputToken) == address(outputToken)) revert SameLeg();
@@ -735,13 +738,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
         // Wrap the encrypted input and grant the inputToken contract ACL access
         // so it can process the handle during transferFrom.
-        euint64 amount = FHE.asEuint64(encAmount);
-        FHE.allow(amount, address(inputToken));
+        euint64 amount = FHE.asEuint64(encAmount, inputProof);
 
         // Pull input tokens into escrow.  FHERC20 transfers are all-or-nothing:
         // if the maker's balance is below `amount`, `actual` returns as 0 and the
         // order is created empty (EMPTY bracket); otherwise it equals `amount`.
-        euint64 actual = inputToken.confidentialTransferFrom(msg.sender, address(this), amount);
+        euint64 actual = FHE.receiveEuint64FromCall(
+            inputToken.confidentialTransferFrom(
+                msg.sender, address(this), FHE.shareEuint64(amount, address(inputToken))
+            ),
+            address(inputToken)
+        );
         FHE.allowThis(actual);
         FHE.allow(actual, msg.sender); // maker can verify their deposit / track fills
 
@@ -818,19 +825,28 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         the order's size, which is favorable to the order.
     ///
     /// @param orderId   The order to increase.
-    /// @param encDelta  Encrypted additional input-token amount (InEuint64).
+    /// @param encDelta   Encrypted additional input-token amount handle.
+    /// @param inputProof Batch signature covering `encDelta`, bound to this contract.
     /// @return seq      The seq of the new bracket snapshot to publish.
-    function topUpOrder(uint256 orderId, InEuint64 calldata encDelta) external nonReentrant returns (uint64 seq) {
+    function topUpOrder(
+        uint256 orderId,
+        externalEuint64 encDelta,
+        bytes calldata inputProof
+    ) external nonReentrant returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (o.closed) revert OrderClosed();
         if (msg.sender != o.maker) revert NotMaker();
 
-        euint64 delta = FHE.asEuint64(encDelta);
-        FHE.allow(delta, address(o.inputToken));
+        euint64 delta = FHE.asEuint64(encDelta, inputProof);
 
         // Pull additional tokens into OTC escrow (all-or-nothing).
-        euint64 actual = o.inputToken.confidentialTransferFrom(msg.sender, address(this), delta);
+        euint64 actual = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransferFrom(
+                msg.sender, address(this), FHE.shareEuint64(delta, address(o.inputToken))
+            ),
+            address(o.inputToken)
+        );
         FHE.allowThis(actual);
 
         // Grow remaining balance.
@@ -872,10 +888,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///
     /// @param orderId         The order to fill against.
     /// @param encTokensWanted Encrypted amount of inputToken the taker wants.
+    /// @param inputProof      Batch signature covering `encTokensWanted`, bound to this contract.
     /// @return seq            The seq of the post-fill bracket snapshot to publish.
     function fillOrder(
         uint256 orderId,
-        InEuint64 calldata encTokensWanted
+        externalEuint64 encTokensWanted,
+        bytes calldata inputProof
     ) external payable nonReentrant returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
@@ -887,7 +905,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         if (msg.value < bond) revert WrongBond();
 
         // ── Settle the swap atomically (isolated frame to bound stack depth) ───
-        _swap(o, encTokensWanted);
+        _swap(o, encTokensWanted, inputProof);
 
         // ── Snapshot the post-fill bracket under a fresh seq (fill record) ─────
         seq = ++o.latestSeq;
@@ -913,10 +931,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///      separate stack frame (keeps the IR/legacy stack within bounds).
     /// @param o               The order being filled (mutated in place).
     /// @param encTokensWanted The taker's encrypted requested input amount.
-    function _swap(Order storage o, InEuint64 calldata encTokensWanted) internal {
+    /// @param inputProof      Batch signature covering `encTokensWanted`.
+    function _swap(Order storage o, externalEuint64 encTokensWanted, bytes calldata inputProof) internal {
         // Cap requested amount at available remaining and the overflow bound.
         // FHE.mul below is mod 2^64; cap so eActual × price never wraps.
-        euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted), o.eRemaining);
+        euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted, inputProof), o.eRemaining);
         eActual = FHE.min(eActual, FHE.asEuint64(type(uint64).max / o.price));
         FHE.allowThis(eActual);
 
@@ -925,8 +944,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(eOutput);
 
         // Pull output from taker directly to maker (no intermediate escrow).
-        FHE.allow(eOutput, address(o.outputToken));
-        euint64 eOutputPaid = o.outputToken.confidentialTransferFrom(msg.sender, o.maker, eOutput);
+        euint64 eOutputPaid = FHE.receiveEuint64FromCall(
+            o.outputToken.confidentialTransferFrom(
+                msg.sender, o.maker, FHE.shareEuint64(eOutput, address(o.outputToken))
+            ),
+            address(o.outputToken)
+        );
         FHE.allowThis(eOutputPaid);
 
         // Release input only if the taker paid in full (and not dust).
@@ -938,9 +961,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(eRelease);
 
         // Send released input from OTC escrow to taker.
-        FHE.allow(eRelease, address(o.inputToken));
         FHE.allow(eRelease, msg.sender); // taker can verify receipt
-        o.inputToken.confidentialTransfer(msg.sender, eRelease);
+        o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken)));
 
         // Decrement remaining.
         o.eRemaining = FHE.sub(o.eRemaining, eRelease);
@@ -1085,8 +1107,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         }
 
         // Return escrowed input.
-        FHE.allow(o.eRemaining, address(o.inputToken));
-        o.inputToken.confidentialTransfer(o.maker, o.eRemaining);
+        o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken)));
 
         // Return the maker bond, if any.
         uint256 bond = o.makerBondWei;

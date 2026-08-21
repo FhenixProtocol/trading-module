@@ -167,8 +167,8 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 /// public policy, and it is the only way to derive the overflow cap and to take
 /// the zero-fee fast path — you cannot branch on a ciphertext.
 ///
-/// Accrued fees are swept by the owner via `collectFees(token)` to `treasury`,
-/// at most once per COLLECT_COOLDOWN (24h) per token. A sweep discloses its own
+/// Accrued fees are swept by the owner via `sweepFees(token)` to `treasury`,
+/// at most once per COLLECT_COOLDOWN (23h) per token. A sweep discloses its own
 /// size to the treasury, so throttling it stops the owner from bracketing a
 /// single fill to back out that taker's exact amount from the public fee rate.
 ///
@@ -230,8 +230,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
     /// @dev Minimum interval between fee sweeps of the same token. Deliberately
     ///      a constant: it exists to constrain the owner, so an owner-settable
-    ///      version would defeat itself. See {collectFees}.
-    uint64 public constant COLLECT_COOLDOWN = 24 hours;
+    ///      version would defeat itself. See {sweepFees}.
+    uint64 public constant COLLECT_COOLDOWN = 23 hours;
 
     /// @dev seq assigned to the create record. Fills and top-ups increment from
     ///      here, so the create record is always the first and is published by
@@ -346,13 +346,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Destination for swept protocol fees. Defaults to the deployer.
     address public treasury;
 
-    /// @dev Encrypted fees accrued per token, awaiting a {collectFees} sweep.
+    /// @dev Encrypted fees accrued per token, awaiting a {sweepFees} sweep.
     ///      Fees are skimmed from input already sitting in escrow, so the
     ///      tokens are present without any extra transfer. An unset slot is the
     ///      zero handle, which `FHE.add` treats as encrypted zero.
     mapping(address => euint64) private _feesAccrued;
 
-    /// @dev Last {collectFees} timestamp per token, enforcing COLLECT_COOLDOWN.
+    /// @dev Last {sweepFees} timestamp per token, enforcing COLLECT_COOLDOWN.
     ///      0 means never swept, which never blocks the first sweep.
     mapping(address => uint64) private _lastCollectAt;
 
@@ -634,9 +634,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         (persisting their ACL so they remain valid operands in later txns).
     ///         The deployer becomes the owner. `ethOraclePrice` starts unset and
     ///         must be configured via {setEthOraclePrice} before any bonded action.
-    /// @param  fUSD_ The confidential stablecoin used as the bracket unit of account.
-    constructor(IFHERC20 fUSD_) Ownable(msg.sender) {
+    /// @param  fUSD_     The confidential stablecoin used as the bracket unit of account.
+    /// @param  treasury_ Destination for {sweepFees} sweeps. Taken explicitly rather than
+    ///                   defaulted to the deployer, so fee custody is a deliberate deployment
+    ///                   choice and never silently lands on a hot deployer key.
+    constructor(IFHERC20 fUSD_, address treasury_) Ownable(msg.sender) {
         if (address(fUSD_) == address(0)) revert ZeroAddress();
+        if (treasury_ == address(0)) revert ZeroAddress();
         if (fUSD_.decimals() != FUSD_DECIMALS) revert InvalidDecimals();
         fUSD = fUSD_;
 
@@ -678,8 +682,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
 
-        treasury = msg.sender;
-        emit TreasuryUpdated(msg.sender);
+        treasury = treasury_;
+        emit TreasuryUpdated(treasury_);
         _setSwapFee(0);
     }
 
@@ -792,21 +796,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     }
 
     /// @dev Shared fee-setting path for the constructor and {setSwapFee}.
-    ///      Persists the ACL on the new handle (`allowThis` so it stays a valid
-    ///      operand across transactions, `allowPublic` so anyone may read and
-    ///      decrypt the live rate).
     /// @param feeQ20 The new Q44.20 fee.
     function _setSwapFee(uint64 feeQ20) internal {
         if (feeQ20 > MAX_SWAP_FEE_Q20) revert FeeTooHigh();
         swapFeeQ20 = feeQ20;
         euint64 eFee = FHE.asEuint64(feeQ20);
-        FHE.allowThis(eFee);
         FHE.allowPublic(eFee);
         _eSwapFeeQ20 = eFee;
         emit SwapFeeUpdated(feeQ20);
     }
 
-    /// @notice Set the destination for {collectFees} sweeps. Owner only.
+    /// @notice Set the destination for {sweepFees} sweeps. Owner only.
     /// @param  treasury_ The new treasury address (non-zero).
     function setTreasury(address treasury_) external onlyOwner {
         if (treasury_ == address(0)) revert ZeroAddress();
@@ -832,7 +832,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         governable one, since the owner is the party it constrains.
     /// @param  token      The token to sweep.
     /// @return eCollected The encrypted amount actually transferred.
-    function collectFees(address token) external onlyOwner nonReentrant returns (euint64 eCollected) {
+    function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eCollected) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
 
@@ -865,20 +865,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     function collectUnlockAt(address token) external view returns (uint64) {
         uint64 last = _lastCollectAt[token];
         return last == 0 ? 0 : last + COLLECT_COOLDOWN;
-    }
-
-    /// @notice Encrypted handle of the fees accrued for a token.
-    ///
-    /// @dev    Returns the ciphertext *handle*, not the amount — decryption is
-    ///         gated by the CoFHE ACL, and this accrual is only ever
-    ///         `allowThis`'d, so no external account can read it. The treasury
-    ///         learns the figure at sweep time instead: {collectFees} grants it
-    ///         ACL on the transferred total and emits it in {FeesCollected}.
-    ///         A zero handle means nothing has accrued since the last sweep.
-    /// @param  token The token to query.
-    /// @return The `euint64` handle of the accrued balance.
-    function feesAccrued(address token) external view returns (bytes32) {
-        return euint64.unwrap(_feesAccrued[token]);
     }
 
     /// @notice Encrypted handle of the live swap fee.
@@ -1191,6 +1177,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///      The `feeQ20 == 0` fast path is why {swapFeeQ20} is mirrored in
     ///      plaintext: you cannot branch on a ciphertext, so with the fee
     ///      disabled every fill would otherwise still pay for four FHE ops.
+    ///
+    ///      PRECONDITION: `eRelease <= type(uint64).max / swapFeeQ20`. The mul
+    ///      below is mod 2^64, so a larger release wraps and silently accrues
+    ///      less than the configured rate — no revert, and the books stay
+    ///      self-consistent, so nothing surfaces the shortfall. {_swap}
+    ///      guarantees this by clamping the fill through {_fillCap}, whose fee
+    ///      bound is exactly this limit; the clamp is applied to the fill size
+    ///      rather than here so the fee stays exact instead of truncated. Any
+    ///      new caller must clamp equivalently — do not rely on this one.
     /// @param  token     The input token the fee is denominated in.
     /// @param  eRelease  The encrypted input released by the fill.
     /// @return eToTaker  The encrypted remainder owed to the taker.

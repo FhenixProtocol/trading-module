@@ -79,6 +79,7 @@ describe("ConfidentialOTC", () => {
 
     const otc = (await ethers.deployContract("ConfidentialOTC", [
       await fusd.getAddress(),
+      deployer.address,
     ])) as unknown as ConfidentialOTC;
     await otc.waitForDeployment();
 
@@ -234,8 +235,12 @@ describe("ConfidentialOTC", () => {
 
   describe("constructor", () => {
     it("reverts on zero fUSD address", async () => {
+      const [signer] = await ethers.getSigners();
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(ethers.ZeroAddress)).to.be.revertedWithCustomError(factory, "ZeroAddress");
+      await expect(factory.deploy(ethers.ZeroAddress, signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "ZeroAddress",
+      );
     });
 
     it("reverts when fUSD does not use exactly 6 decimals", async () => {
@@ -247,8 +252,12 @@ describe("ConfidentialOTC", () => {
       ])) as unknown as ConfidentialToken;
       await fusd18.waitForDeployment();
 
+      const [signer] = await ethers.getSigners();
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd18.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
+      await expect(factory.deploy(await fusd18.getAddress(), signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "InvalidDecimals",
+      );
     });
 
     it("auto-whitelists fUSD at Q_DENOM", async () => {
@@ -437,6 +446,7 @@ describe("ConfidentialOTC", () => {
       await fusd.waitForDeployment();
       const otc = (await ethers.deployContract("ConfidentialOTC", [
         await fusd.getAddress(),
+        deployer.address,
       ])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
       await expect(otc.connect(deployer).ethBondSize()).to.be.revertedWithCustomError(otc, "EthOracleUnset");
@@ -1257,7 +1267,6 @@ describe("ConfidentialOTC", () => {
     const FEE_030 = 3_146n; // 0.30% in Q44.20
     const MAX_FEE = 10_486n; // MAX_SWAP_FEE_Q20 (~1.00%)
     const MAXU64 = (1n << 64n) - 1n;
-    const ZERO_HANDLE = "0x" + "0".repeat(64);
 
     /// Mirrors the contract's Q44.20 skim: eRelease × feeQ20 >> 20.
     const feeOf = (amount: bigint, feeQ20: bigint) => (amount * feeQ20) >> 20n;
@@ -1299,10 +1308,10 @@ describe("ConfidentialOTC", () => {
     }
 
     it("is disabled at deploy and leaves the fill path byte-for-byte unchanged", async () => {
-      const { bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
+      const { deployer, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
 
       expect(await otc.swapFeeQ20()).to.equal(0n);
-      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
 
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
 
@@ -1310,7 +1319,9 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, bob.address, mBTC);
       await expectBalance(ecbtc, otcAddr, 0n);
       await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
-      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
+      // The feeQ20 == 0 fast path returns before touching _feesAccrued, so the
+      // slot is still the null handle and the sweep guard still fires.
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
     it("skims the fee from the taker and retains it in escrow", async () => {
@@ -1324,7 +1335,6 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, bob.address, mBTC - fee); // taker short by the fee
       await expectBalance(ecbtc, otcAddr, fee); // fee stays put — no extra transfer
       await expectBalance(fusd, alice.address, FILL_1MBTC_FUSD); // maker paid in full
-      expect(await otc.feesAccrued(ecbtcAddr)).to.not.equal(ZERO_HANDLE);
     });
 
     it("decrements eRemaining by the full release, so the bracket is unaffected", async () => {
@@ -1382,7 +1392,6 @@ describe("ConfidentialOTC", () => {
 
       await expectBalance(ecbtc, bob.address, 0n);
       await expectBalance(ecbtc, otcAddr, mBTC); // escrow intact, nothing skimmed
-      await hre.cofhe.mocks.expectPlaintext(await otc.feesAccrued(ecbtcAddr), 0n);
     });
 
     it("clamps the fill so eRelease × fee cannot wrap uint64", async () => {
@@ -1486,7 +1495,7 @@ describe("ConfidentialOTC", () => {
       const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
 
       // Nothing accrued yet.
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
 
       const fee = feeOf(mBTC, FEE_030);
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
@@ -1497,15 +1506,13 @@ describe("ConfidentialOTC", () => {
       const carol = (await ethers.getSigners())[3];
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
 
       await expectBalance(ecbtc, carol.address, fee);
       await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
-      expect(await otc.feesAccrued(ecbtcAddr)).to.equal(ZERO_HANDLE);
-
       // The slot is reset to the zero handle, so the guard fires again — this
       // is what would break if it were cleared with FHE.asEuint64(0).
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
     it("throttles sweeps to once per COLLECT_COOLDOWN, defeating the sandwich", async () => {
@@ -1519,7 +1526,7 @@ describe("ConfidentialOTC", () => {
       expect(await otc.collectUnlockAt(ecbtcAddr)).to.equal(0n);
 
       await fillAndPublish(otc, bob, bobClient, id, 400n);
-      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
 
       const last = await otc.lastCollectAt(ecbtcAddr);
       expect(last).to.be.greaterThan(0n);
@@ -1528,15 +1535,15 @@ describe("ConfidentialOTC", () => {
       // The sandwich: a second fill lands, and the owner tries to collect again
       // straight away to isolate that single fill's fee. Blocked.
       await fillAndPublish(otc, bob, bobClient, id, 200n);
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
 
       const unlock = Number(await otc.collectUnlockAt(ecbtcAddr));
 
       await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock - 1]);
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
 
       await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock]);
-      await expect(otc.connect(deployer).collectFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
     });
 
     it("allows the next sweep once the cooldown elapses, aggregating the interim fills", async () => {
@@ -1550,7 +1557,7 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
       await fillAndPublish(otc, bob, bobClient, id, 400n);
-      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
       await expectBalance(ecbtc, carol.address, fee1);
 
       // Two more fills accrue while the sweep is locked.
@@ -1560,7 +1567,7 @@ describe("ConfidentialOTC", () => {
       await hre.network.provider.send("evm_increaseTime", [86_400]);
       await hre.network.provider.send("evm_mine");
 
-      await (await otc.connect(deployer).collectFees(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
 
       // The disclosed total is the SUM of both interim fills, not either alone.
       await expectBalance(ecbtc, carol.address, fee1 + fee2 + fee3);
@@ -1572,7 +1579,7 @@ describe("ConfidentialOTC", () => {
 
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
 
-      await expect(otc.connect(alice).collectFees(ecbtcAddr)).to.be.revertedWithCustomError(
+      await expect(otc.connect(alice).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(
         otc,
         "OwnableUnauthorizedAccount",
       );

@@ -1519,7 +1519,7 @@ describe("ConfidentialOTC", () => {
       const { deployer, bob, ecbtc, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
 
       const cooldown = await otc.COLLECT_COOLDOWN();
-      expect(cooldown).to.equal(86_400n);
+      expect(cooldown).to.equal(82_800n); // 23h
 
       // First sweep is never blocked — no prior collection to wait on.
       expect(await otc.lastCollectAt(ecbtcAddr)).to.equal(0n);
@@ -1564,7 +1564,7 @@ describe("ConfidentialOTC", () => {
       await fillAndPublish(otc, bob, bobClient, id, 200n);
       await fillAndPublish(otc, bob, bobClient, id, 100n);
 
-      await hre.network.provider.send("evm_increaseTime", [86_400]);
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.COLLECT_COOLDOWN())]);
       await hre.network.provider.send("evm_mine");
 
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();

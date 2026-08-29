@@ -718,6 +718,91 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // delisted token — trading halts, unwinding does not
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("delisted token", () => {
+    /// Active ecBTC → fUSD order, ready for a leg to be delisted under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("blocks fills when the escrowed leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("blocks fills when the requested leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, fusdAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(fusdAddr)).wait();
+
+      // Either direction moves the delisted token to a new holder for value,
+      // so both legs gate — not just the one sitting in escrow.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(fusdAddr);
+    });
+
+    it("blocks top-ups, so a delisted order cannot grow", async () => {
+      const { deployer, alice, otc, aliceClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await expect(otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the delist", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond is posted while the token is still tradable, then the token is
+      // delisted underneath it. Gating publishBracket here would strand the ETH.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // fill bond, window, bounty
   // ─────────────────────────────────────────────────────────────────────────
 

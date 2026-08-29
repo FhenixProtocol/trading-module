@@ -837,6 +837,50 @@ describe("ConfidentialOTC", () => {
       ).to.changeEtherBalances([bob, deployer], [bond, 0n], { includeFee: false });
       expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
     });
+
+    it("settles on the bounty rate stamped at fill time, not the live one", async () => {
+      const { deployer, bob, otc, bobClient, id, seq } = await withFilledOrder();
+      const bond = await otc.ethBondSize();
+      const bounty = (bond * 2_000n) / 10_000n;
+
+      // The rate in force at fill time is recorded on the bond itself.
+      expect((await otc.getPublish(id, seq)).bountyBps_).to.equal(2_000n);
+
+      // Owner raises the bounty to 100% while the bond is outstanding, then
+      // publishes it themselves — the seizure the live read would have allowed.
+      await (await otc.connect(deployer).setParams(5_000_000n, 0n, 10_000n, 600n)).wait();
+      expect(await otc.bountyBps()).to.equal(10_000n);
+
+      await hre.network.provider.send("evm_increaseTime", [601]);
+      await hre.network.provider.send("evm_mine");
+
+      // The stamped 20% still governs: the depositor keeps the other 80%.
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(bobClient, rec.handle);
+      await expect(
+        otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
+      ).to.changeEtherBalances([bob, deployer], [bond - bounty, bounty], { includeFee: false });
+    });
+
+    it("cannot strand an in-flight keeper publish by zeroing the bounty", async () => {
+      const { deployer, bob, otc, bobClient, id, seq } = await withFilledOrder();
+      const bond = await otc.ethBondSize();
+      const bounty = (bond * 2_000n) / 10_000n;
+
+      await hre.network.provider.send("evm_increaseTime", [601]);
+      await hre.network.provider.send("evm_mine");
+
+      // Owner zeroes the bounty after the keeper has committed to publishing.
+      await (await otc.connect(deployer).setParams(5_000_000n, 0n, 0n, 600n)).wait();
+      expect(await otc.bountyBps()).to.equal(0n);
+
+      // The keeper is still paid the rate the record was posted under.
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(bobClient, rec.handle);
+      await expect(
+        otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
+      ).to.changeEtherBalances([bob, deployer], [bond - bounty, bounty], { includeFee: false });
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────

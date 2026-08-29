@@ -356,7 +356,9 @@ describe("ConfidentialOTC", () => {
 
     it("owner can set the oracle address", async () => {
       const { deployer, bob, otc } = await setup();
-      await (await otc.connect(deployer).setOracle(bob.address)).wait();
+      await expect(otc.connect(deployer).setOracle(bob.address))
+        .to.emit(otc, "OracleUpdated")
+        .withArgs(ethers.ZeroAddress, bob.address);
       expect(await otc.oracle()).to.equal(bob.address);
     });
 

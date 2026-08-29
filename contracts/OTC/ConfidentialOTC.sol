@@ -409,6 +409,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  token The delisted token.
     event TokenDelisted(address indexed token);
 
+    /// @notice The address holding the oracle role was changed.
+    /// @param  previousOracle The address that held the role (0 if disabled).
+    /// @param  newOracle      The address that now holds it (0 disables it).
+    event OracleUpdated(address indexed previousOracle, address indexed newOracle);
+
     /// @notice A whitelisted token's bracket oracle price was updated.
     /// @param  token       The token whose price changed.
     /// @param  oraclePrice The new Q44.20 price.
@@ -613,7 +618,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Set the oracle address. Zero address disables the oracle role.
     /// @param  oracle_ The new oracle address (or address(0) to disable).
     function setOracle(address oracle_) external onlyOwner {
+        address previousOracle = oracle;
         oracle = oracle_;
+        emit OracleUpdated(previousOracle, oracle_);
     }
 
     /// @notice Update the Q44.20 oracle price for a whitelisted token.

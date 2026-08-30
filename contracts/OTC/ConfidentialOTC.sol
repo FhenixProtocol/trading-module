@@ -1227,24 +1227,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         if (!ok) revert EthTransferFailed();
     }
 
-    /// @dev Converts an encrypted input amount to its USD-equivalent for
-    ///      bracket computation. Three cases, in priority order:
-    ///
-    ///   1. inputToken == fUSD  → identity (already in USD).
-    ///   2. outputToken == fUSD → use the maker's order price (Q44.20).
-    ///   3. cANY<>cANY          → use the inputToken oracle price (Q44.20).
-    ///
-    ///      An overflow cap (same pattern as fillOrder) ensures eAmount × price
-    ///      never wraps uint64. For large whale orders the cap still resolves to
-    ///      WHALE — brackets are indicators, not exact values.
+    /// @dev Converts an encrypted input amount to its USD-equivalent for bracket
+    ///      computation, always at the input leg's oracle price — never at the
+    ///      maker-supplied `o.price`, which is unbounded and, since the cap below
+    ///      is inversely tied to the rate, let a maker publish a one-unit order
+    ///      as WHALE. The cap keeps eAmount × price inside uint64.
     /// @param  eAmount The encrypted input-token amount to value.
-    /// @param  o       The order whose legs/price select the conversion path.
+    /// @param  o       The order whose input leg selects the oracle price.
     /// @return The encrypted USD-equivalent (6-decimal fUSD units).
     function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
-        if (address(o.inputToken) == address(fUSD)) return eAmount;
-
-        uint64 convPrice =
-            (address(o.outputToken) == address(fUSD)) ? o.price : _tokenConfig[address(o.inputToken)].oraclePrice;
+        uint64 convPrice = _tokenConfig[address(o.inputToken)].oraclePrice;
+        if (convPrice == Q_DENOM) return eAmount;
 
         uint64 maxSafe = type(uint64).max / convPrice;
         euint64 eSafe = FHE.min(eAmount, FHE.asEuint64(maxSafe));

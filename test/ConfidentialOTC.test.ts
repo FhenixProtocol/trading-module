@@ -533,6 +533,28 @@ describe("ConfidentialOTC", () => {
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
     });
 
+    it("brackets from the oracle, so a maker cannot inflate their own size via price", async () => {
+      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      // The bracket rate used to come from o.price on cANY→fUSD orders. At
+      // uint64.max the overflow cap collapses to 1, so 1 raw unit multiplied
+      // out to 17_592_186_044_415 ($17.6M) — 176x the WHALE floor. Sourcing
+      // the rate from the ecBTC oracle values it at what it is: $0.000065.
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        (1n << 64n) - 1n,
+        0n,
+        ...(await enc(aliceClient, 1n, otc)),
+      );
+
+      expect((await otc.getOrder(id)).bracket).to.equal(NANO);
+    });
+
     it("reverts on zero address, same leg, zero price, and bad expiry", async () => {
       const { alice, otc, aliceClient, fusdAddr, ecbtcAddr } = await setup();
       const amt = await enc(aliceClient, mBTC, otc);

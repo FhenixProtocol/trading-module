@@ -511,6 +511,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error OrderExpired();
     /// @notice Caller is not the order's maker.
     error NotMaker();
+    /// @notice A non-maker tried to cancel an order that has not expired.
+    error NotExpired();
     /// @notice Array argument lengths do not match.
     error LengthMismatch();
     /// @notice A bonded action was attempted before `ethOraclePrice` was set.
@@ -1037,8 +1039,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             }
 
             // Frontier rule: only a publish for the latest record changes listing.
+            // An expired order delists exactly like a depleted one — same
+            // predicate as fillOrder, so listing and fillability cannot diverge.
             if (seq == o.latestSeq) {
-                if (value != BRACKET_EMPTY) {
+                bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+                if (value != BRACKET_EMPTY && !expired) {
                     if (!o.active) {
                         bool wasPending = o.pending;
                         o.active = true;
@@ -1084,17 +1089,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
     /// @notice Cancel an order and return the remaining escrow AND the maker
     ///         bond to the maker. Works in the pending, active, and dormant
-    ///         states. Maker only; terminal.
+    ///         states. Maker only until expiry, then anyone; terminal.
     ///
-    /// @dev    Outstanding fill Publish records survive: their depositors can
-    ///         still publish to settle and recover their bonds. The canonical
-    ///         bracket is moot once closed.
+    /// @dev    Escrow and bond always go to `o.maker`, so a third-party cancel
+    ///         of an expired order moves no value to the caller — it only frees
+    ///         a pair-index slot nothing else can. Expiry 0 stays maker-only.
+    ///         Outstanding fill Publish records survive: their depositors can
+    ///         still publish to settle and recover their bonds.
     /// @param  orderId The order to cancel.
     function cancelOrder(uint256 orderId) external nonReentrant {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
-        if (msg.sender != o.maker) revert NotMaker();
         if (o.closed) revert OrderClosed();
+
+        bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+        if (msg.sender != o.maker && !expired) revert NotExpired();
 
         bool wasActive = o.active;
         o.active = false;

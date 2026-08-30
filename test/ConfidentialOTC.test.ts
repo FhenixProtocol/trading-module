@@ -1153,11 +1153,46 @@ describe("ConfidentialOTC", () => {
       ).to.be.revertedWithCustomError(otc, "WrongBond");
     });
 
-    it("only the maker can cancel; cannot cancel twice", async () => {
-      const { alice, bob, otc, id } = await withOrder();
-      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotMaker");
+    it("only the maker can cancel an unexpired order; cannot cancel twice", async () => {
+      const { alice, bob, otc, id } = await withOrder(); // good-til-cancelled
+      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotExpired");
       await (await otc.connect(alice).cancelOrder(id)).wait();
       await expect(otc.connect(alice).cancelOrder(id)).to.be.revertedWithCustomError(otc, "OrderClosed");
+    });
+
+    it("anyone may retire an expired order, and the escrow still returns to the maker", async () => {
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      // Before expiry the order is maker-only, as always.
+      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotExpired");
+
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // bob is unrelated to the order. He can retire it, but the escrow is
+      // hardcoded to o.maker — alice gets every unit back and the OTC is left
+      // empty, so nothing reached the caller.
+      await expect(otc.connect(bob).cancelOrder(id)).to.emit(otc, "OrderCancelled");
+      await expectBalance(ecbtc, alice.address, ONE);
+      await expectBalance(ecbtc, otcAddr, 0n);
+
+      const order = await otc.getOrder(id);
+      expect(order.closed).to.equal(true);
+      expect(order.active).to.equal(false);
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
     });
 
     it("a cancelled order cannot be filled", async () => {
@@ -1293,6 +1328,45 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(false);
       expect(order.closed).to.equal(true);
+    });
+
+    it("delists on the next publish once expired, instead of staying listed", async () => {
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, 2n * mBTC, otc)),
+      );
+
+      // A fill lands while the order is still live, leaving an unsettled record.
+      const seq = await fill(otc, bob, bobClient, id, 200n);
+      expect((await otc.getOrder(id)).active).to.equal(true);
+
+      // Expiry passes before the taker publishes it.
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // The bracket is still non-EMPTY (escrow remains), so the old frontier
+      // rule kept the order listed and unfillable. It now delists on expiry.
+      const value = await publish(otc, bob, bobClient, id, seq);
+      expect(value).to.not.equal(EMPTY);
+
+      const order = await otc.getOrder(id);
+      expect(order.active).to.equal(false);
+      expect(order.closed).to.equal(false); // dormant, not destroyed — escrow retained
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC - 200n);
     });
   });
 });

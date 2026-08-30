@@ -235,6 +235,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @dev Precomputed encrypted zero, reused for comparisons and fallbacks.
     euint64 private immutable _E_ZERO64;
 
+    /// @dev Q_DENOM - 1, added before the Q44.20 right-shift so the taker's
+    ///      obligation rounds up instead of down. See {_swap}.
+    euint64 private immutable _E_Q_MASK;
+
     // ─────────────────────────────────────────────────────────────────────────
     // Token whitelist & oracle
     // ─────────────────────────────────────────────────────────────────────────
@@ -564,6 +568,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
         _E_SHR_20 = FHE.asEuint64(20);
         _E_ZERO64 = FHE.asEuint64(0);
+        _E_Q_MASK = FHE.asEuint64(Q_DENOM - 1);
 
         // Persist ACL on every reused handle so they remain usable as operands
         // in later transactions (the auto-grant from FHE.asEuint* is transient).
@@ -579,6 +584,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(_LARGE_MAX);
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
+        FHE.allowThis(_E_Q_MASK);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -934,13 +940,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param inputProof      Batch signature covering `encTokensWanted`.
     function _swap(Order storage o, externalEuint64 encTokensWanted, bytes calldata inputProof) internal {
         // Cap requested amount at available remaining and the overflow bound.
-        // FHE.mul below is mod 2^64; cap so eActual × price never wraps.
+        // FHE.mul/add are mod 2^64 and the ceil below adds Q_DENOM-1 to the
+        // product, so the bound reserves room for that term as well.
         euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted, inputProof), o.eRemaining);
-        eActual = FHE.min(eActual, FHE.asEuint64(type(uint64).max / o.price));
+        eActual = FHE.min(eActual, FHE.asEuint64((type(uint64).max - (Q_DENOM - 1)) / o.price));
         FHE.allowThis(eActual);
 
-        // Output cost via Q44.20 price: eActual × price >> 20.
-        euint64 eOutput = FHE.shr(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_SHR_20);
+        // Rounded UP, so the sub-unit residue is charged to the taker rather
+        // than gifted to them — it is the maker's, and up to one raw unit/fill.
+        euint64 eOutput = FHE.shr(FHE.add(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_Q_MASK), _E_SHR_20);
         FHE.allowThis(eOutput);
 
         // Pull output from taker directly to maker (no intermediate escrow).

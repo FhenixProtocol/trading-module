@@ -39,8 +39,10 @@ const mBTC = ONE / 1_000n; // 0.001 ecBTC = 1_000 raw → $65 at oracle → NANO
 const FILL_1MBTC_FUSD = 65n * ONE; // 1_000 raw ecBTC → 65_000_000 fUSD ($65)
 const FILL_400RAW_FUSD = 26n * ONE; // 400   raw ecBTC → 26_000_000 fUSD ($26)
 const FILL_200RAW_FUSD = 13n * ONE; // 200   raw ecBTC → 13_000_000 fUSD ($13)
-const FILL_1MBTC_ETH = 18_571n; // 1_000 raw ecBTC → 18_571 raw ecETH
-const FILL_400RAW_ETH = 7_428n; // 400   raw ecBTC → 7_428  raw ecETH
+// PRICE_BTC_ETH is not a multiple of 2^20, so the exact costs (18_571.43 and
+// 7_428.57) carry a residue; the taker pays the ceiling, so the maker keeps it.
+const FILL_1MBTC_ETH = 18_572n; // 1_000 raw ecBTC → 18_572 raw ecETH
+const FILL_400RAW_ETH = 7_429n; // 400   raw ecBTC → 7_429  raw ecETH
 
 describe("ConfidentialOTC", () => {
   before(async () => {

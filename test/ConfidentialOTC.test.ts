@@ -356,7 +356,9 @@ describe("ConfidentialOTC", () => {
 
     it("owner can set the oracle address", async () => {
       const { deployer, bob, otc } = await setup();
-      await (await otc.connect(deployer).setOracle(bob.address)).wait();
+      await expect(otc.connect(deployer).setOracle(bob.address))
+        .to.emit(otc, "OracleUpdated")
+        .withArgs(ethers.ZeroAddress, bob.address);
       expect(await otc.oracle()).to.equal(bob.address);
     });
 
@@ -712,6 +714,233 @@ describe("ConfidentialOTC", () => {
       await expect(
         otc.connect(bob).fillOrder(id, ...(await enc(bobClient, mBTC, otc)), { value: bond }),
       ).to.be.revertedWithCustomError(otc, "OrderNotActive");
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // delisted token — trading halts, unwinding does not
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("delisted token", () => {
+    /// Active ecBTC → fUSD order, ready for a leg to be delisted under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("blocks fills when the escrowed leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("blocks fills when the requested leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, fusdAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(fusdAddr)).wait();
+
+      // Either direction moves the delisted token to a new holder for value,
+      // so both legs gate — not just the one sitting in escrow.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(fusdAddr);
+    });
+
+    it("blocks top-ups, so a delisted order cannot grow", async () => {
+      const { deployer, alice, otc, aliceClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await expect(otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the delist", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond is posted while the token is still tradable, then the token is
+      // delisted underneath it. Gating publishBracket here would strand the ETH.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // pause — the contract-scoped twin of delistToken
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("pause", () => {
+    /// Active ecBTC → fUSD order, ready for the contract to be paused under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("only the owner can pause or unpause", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      await expect(otc.connect(alice).pause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      await (await otc.connect(deployer).pause()).wait();
+      await expect(otc.connect(alice).unpause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      expect(await otc.paused()).to.equal(true);
+    });
+
+    it("blocks new orders while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc
+          .connect(alice)
+          .createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks fills while paused, on a pair whose legs are both still whitelisted", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      // Nothing is delisted here — the halt is contract-scoped, which is the
+      // whole point of having pause alongside delistToken.
+      const bond = await otc.ethBondSize();
+      await expect(
+        otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks top-ups while paused", async () => {
+      const { deployer, alice, otc, aliceClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the pause", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond posted while trading is open, then the contract is paused under
+      // it. Gating publishBracket here would strand the ETH for the length of
+      // the pause — which, for a migration, is indefinite.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).pause()).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+
+    it("still lets a pending order activate while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      // Created (escrow already moved) but not yet activated when the pause
+      // lands. activateOrder is a publish, not an entry — it must stay open so
+      // the order reaches a state the maker can reason about and cancel from.
+      const id = await createOrder(
+        otc,
+        alice,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      await (await otc.connect(deployer).pause()).wait();
+
+      await activate(otc, alice, aliceClient, id);
+      expect((await otc.getOrder(id)).active).to.equal(true);
+    });
+
+    it("restores trading on unpause", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+      expect(await otc.paused()).to.equal(false);
+
+      expect(await fillAndPublish(otc, bob, bobClient, id, 400n)).to.equal(NANO);
+    });
+
+    it("unpausing does not re-list a token delisted while paused", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+
+      // The two levers are independent: lifting the contract-scoped halt must
+      // not lift the asset-scoped one.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
     });
   });
 

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.27;
 
 import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
+import { Pausable } from '@openzeppelin/contracts/utils/Pausable.sol';
 import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import { FHE, euint64, euint8, ebool, externalEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
@@ -106,6 +107,21 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// designated `oracle` address (or the owner).
 ///
 /// ──────────────────────────────────────────────────────────────────────────
+/// Halting: delist (asset-scoped) vs. pause (contract-scoped)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Two owner levers halt trading, differently scoped: `delistToken` clears one
+/// token's whitelist flag, making that token's orders cancel-only while every
+/// other pair keeps trading (the lever for a bad *asset*), and `pause` stops
+/// every pair at once (the lever for a bad *contract*, or a migration). Both
+/// gate only the paths that OPEN or INCREASE exposure — `createOrder`,
+/// `fillOrder`, `topUpOrder`. Unwinding is never gated: `cancelOrder`,
+/// `activateOrder` and `publishBracket` stay callable under both, so a halt
+/// never strands escrow or an already-posted bond. A fill is not an unwind —
+/// it hands the halted asset to a new holder at an `o.price` fixed at
+/// `createOrder` and never repriceable.
+///
+/// ──────────────────────────────────────────────────────────────────────────
 /// Order model
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -164,7 +180,7 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 ///   5 = WHALE    ≥ $100 000
 ///   255 = UNPUBLISHED  sentinel before the first reveal (pending orders)
 ///
-contract ConfidentialOTC is Ownable, ReentrancyGuard {
+contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -437,9 +453,14 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  oraclePrice The initial Q44.20 oracle price assigned to it.
     event TokenWhitelisted(address indexed token, uint64 oraclePrice);
 
-    /// @notice A token was removed from the whitelist (existing orders are unaffected).
+    /// @notice A token was removed from the whitelist; its orders are cancel-only.
     /// @param  token The delisted token.
     event TokenDelisted(address indexed token);
+
+    /// @notice The address holding the oracle role was changed.
+    /// @param  previousOracle The address that held the role (0 if disabled).
+    /// @param  newOracle      The address that now holds it (0 disables it).
+    event OracleUpdated(address indexed previousOracle, address indexed newOracle);
 
     /// @notice A whitelisted token's bracket oracle price was updated.
     /// @param  token       The token whose price changed.
@@ -645,9 +666,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         emit TokenWhitelisted(token, initialPrice);
     }
 
-    /// @notice Remove a token from the whitelist.
-    /// @dev    Existing orders for this token are unaffected; only new orders
-    ///         are blocked.
+    /// @notice Remove a token from the whitelist, halting trading in it.
+    /// @dev    Blocks createOrder, fillOrder and topUpOrder on either leg.
+    ///         Existing orders become cancel-only: cancelOrder and
+    ///         publishBracket stay open so escrow and bonds can be recovered.
     /// @param  token The token to delist.
     function delistToken(address token) external onlyOwner {
         _tokenConfig[token].whitelisted = false;
@@ -657,7 +679,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Set the oracle address. Zero address disables the oracle role.
     /// @param  oracle_ The new oracle address (or address(0) to disable).
     function setOracle(address oracle_) external onlyOwner {
+        address previousOracle = oracle;
         oracle = oracle_;
+        emit OracleUpdated(previousOracle, oracle_);
     }
 
     /// @notice Update the Q44.20 oracle price for a whitelisted token.
@@ -766,6 +790,20 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         bountyBps = bountyBps_;
         windowSeconds = windowSeconds_;
         emit ParamsUpdated(fillBondUsd_, makerBondUsd_, bountyBps_, windowSeconds_);
+    }
+
+    /// @notice Halt trading across every pair. Owner only.
+    /// @dev    Blocks createOrder, fillOrder and topUpOrder contract-wide;
+    ///         cancelOrder, activateOrder and publishBracket stay open so
+    ///         escrow and posted bonds stay recoverable. See {delistToken}.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume trading. Owner only.
+    /// @dev    Tokens delisted while paused stay delisted — levers are independent.
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /// @notice Return the whitelist config for a token.
@@ -877,11 +915,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint64 expiry,
         externalEuint64 encAmount,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint256 orderId) {
+    ) external payable nonReentrant whenNotPaused returns (uint256 orderId) {
         if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
         if (address(inputToken) == address(outputToken)) revert SameLeg();
-        if (!_tokenConfig[address(inputToken)].whitelisted) revert TokenNotWhitelisted(address(inputToken));
-        if (!_tokenConfig[address(outputToken)].whitelisted) revert TokenNotWhitelisted(address(outputToken));
+        _requireWhitelisted(address(inputToken), address(outputToken));
         if (price == 0) revert ZeroPrice();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
@@ -986,11 +1023,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encDelta,
         bytes calldata inputProof
-    ) external nonReentrant returns (uint64 seq) {
+    ) external nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (o.closed) revert OrderClosed();
         if (msg.sender != o.maker) revert NotMaker();
+        _requireWhitelisted(address(o.inputToken), address(o.outputToken));
 
         euint64 delta = FHE.asEuint64(encDelta, inputProof);
 
@@ -1049,11 +1087,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encTokensWanted,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint64 seq) {
+    ) external payable nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (!o.active) revert OrderNotActive();
         if (o.expiry != 0 && block.timestamp > o.expiry) revert OrderExpired();
+        _requireWhitelisted(address(o.inputToken), address(o.outputToken));
 
         // Fill bond.
         uint256 bond = ethBondSize();
@@ -1345,6 +1384,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     // ─────────────────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Reverts unless both legs are currently whitelisted. Enforced on
+    ///      every path that opens or increases exposure — create, fill, top-up.
+    /// @param inputToken  The order's escrowed leg.
+    /// @param outputToken The order's requested leg.
+    function _requireWhitelisted(address inputToken, address outputToken) internal view {
+        if (!_tokenConfig[inputToken].whitelisted) revert TokenNotWhitelisted(inputToken);
+        if (!_tokenConfig[outputToken].whitelisted) revert TokenNotWhitelisted(outputToken);
+    }
 
     /// @dev Builds the {OrderView} projection, sourcing the frontier bracket
     ///      handle from the latest publish record.

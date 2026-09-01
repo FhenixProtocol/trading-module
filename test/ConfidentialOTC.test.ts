@@ -803,6 +803,148 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // pause — the contract-scoped twin of delistToken
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("pause", () => {
+    /// Active ecBTC → fUSD order, ready for the contract to be paused under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("only the owner can pause or unpause", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      await expect(otc.connect(alice).pause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      await (await otc.connect(deployer).pause()).wait();
+      await expect(otc.connect(alice).unpause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      expect(await otc.paused()).to.equal(true);
+    });
+
+    it("blocks new orders while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc
+          .connect(alice)
+          .createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks fills while paused, on a pair whose legs are both still whitelisted", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      // Nothing is delisted here — the halt is contract-scoped, which is the
+      // whole point of having pause alongside delistToken.
+      const bond = await otc.ethBondSize();
+      await expect(
+        otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks top-ups while paused", async () => {
+      const { deployer, alice, otc, aliceClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the pause", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond posted while trading is open, then the contract is paused under
+      // it. Gating publishBracket here would strand the ETH for the length of
+      // the pause — which, for a migration, is indefinite.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).pause()).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+
+    it("still lets a pending order activate while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      // Created (escrow already moved) but not yet activated when the pause
+      // lands. activateOrder is a publish, not an entry — it must stay open so
+      // the order reaches a state the maker can reason about and cancel from.
+      const id = await createOrder(
+        otc,
+        alice,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      await (await otc.connect(deployer).pause()).wait();
+
+      await activate(otc, alice, aliceClient, id);
+      expect((await otc.getOrder(id)).active).to.equal(true);
+    });
+
+    it("restores trading on unpause", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+      expect(await otc.paused()).to.equal(false);
+
+      expect(await fillAndPublish(otc, bob, bobClient, id, 400n)).to.equal(NANO);
+    });
+
+    it("unpausing does not re-list a token delisted while paused", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+
+      // The two levers are independent: lifting the contract-scoped halt must
+      // not lift the asset-scoped one.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // fill bond, window, bounty
   // ─────────────────────────────────────────────────────────────────────────
 

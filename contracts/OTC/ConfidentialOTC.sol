@@ -2,6 +2,7 @@
 pragma solidity ^0.8.27;
 
 import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
+import { Pausable } from '@openzeppelin/contracts/utils/Pausable.sol';
 import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import { FHE, euint64, euint8, ebool, externalEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
@@ -105,6 +106,21 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 /// designated `oracle` address (or the owner).
 ///
 /// ──────────────────────────────────────────────────────────────────────────
+/// Halting: delist (asset-scoped) vs. pause (contract-scoped)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Two owner levers halt trading, differently scoped: `delistToken` clears one
+/// token's whitelist flag, making that token's orders cancel-only while every
+/// other pair keeps trading (the lever for a bad *asset*), and `pause` stops
+/// every pair at once (the lever for a bad *contract*, or a migration). Both
+/// gate only the paths that OPEN or INCREASE exposure — `createOrder`,
+/// `fillOrder`, `topUpOrder`. Unwinding is never gated: `cancelOrder`,
+/// `activateOrder` and `publishBracket` stay callable under both, so a halt
+/// never strands escrow or an already-posted bond. A fill is not an unwind —
+/// it hands the halted asset to a new holder at an `o.price` fixed at
+/// `createOrder` and never repriceable.
+///
+/// ──────────────────────────────────────────────────────────────────────────
 /// Order model
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -163,7 +179,7 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 ///   5 = WHALE    ≥ $100 000
 ///   255 = UNPUBLISHED  sentinel before the first reveal (pending orders)
 ///
-contract ConfidentialOTC is Ownable, ReentrancyGuard {
+contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -668,6 +684,20 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         emit ParamsUpdated(fillBondUsd_, makerBondUsd_, bountyBps_, windowSeconds_);
     }
 
+    /// @notice Halt trading across every pair. Owner only.
+    /// @dev    Blocks createOrder, fillOrder and topUpOrder contract-wide;
+    ///         cancelOrder, activateOrder and publishBracket stay open so
+    ///         escrow and posted bonds stay recoverable. See {delistToken}.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume trading. Owner only.
+    /// @dev    Tokens delisted while paused stay delisted — levers are independent.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     /// @notice Return the whitelist config for a token.
     /// @param  token The token to query.
     /// @return The token's {TokenConfig} (whitelisted flag, oracle price, timestamp).
@@ -732,7 +762,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint64 expiry,
         externalEuint64 encAmount,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint256 orderId) {
+    ) external payable nonReentrant whenNotPaused returns (uint256 orderId) {
         if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
         if (address(inputToken) == address(outputToken)) revert SameLeg();
         _requireWhitelisted(address(inputToken), address(outputToken));
@@ -839,7 +869,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encDelta,
         bytes calldata inputProof
-    ) external nonReentrant returns (uint64 seq) {
+    ) external nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (o.closed) revert OrderClosed();
@@ -902,7 +932,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encTokensWanted,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint64 seq) {
+    ) external payable nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (!o.active) revert OrderNotActive();

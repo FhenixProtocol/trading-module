@@ -569,6 +569,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     error OrderNotActive();
     /// @notice The order has been cancelled (terminal).
     error OrderClosed();
+    /// @notice The order is still open, so there is no leftover escrow to claim.
+    error OrderNotClosed();
     /// @notice The order is past its expiry timestamp.
     error OrderExpired();
     /// @notice Caller is not the order's maker.
@@ -1158,11 +1160,16 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(eRelease);
 
         // Send released input from OTC escrow to taker.
-        FHE.allow(eRelease, msg.sender); // taker can verify receipt
-        o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken)));
+        euint64 eDelivered = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        FHE.allowThis(eDelivered);
+        FHE.allow(eDelivered, msg.sender); // taker can verify receipt
 
-        // Decrement remaining.
-        o.eRemaining = FHE.sub(o.eRemaining, eRelease);
+        // Decrement remaining. Any shortfall stays in eRemaining, so it remains
+        // the maker's and is recoverable by cancelOrder.
+        o.eRemaining = FHE.sub(o.eRemaining, eDelivered);
         FHE.allowThis(o.eRemaining);
         FHE.allow(o.eRemaining, o.maker); // maker can track their position
     }
@@ -1310,8 +1317,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             _pairOrders[_pairKey(address(o.inputToken), address(o.outputToken))].remove(orderId);
         }
 
-        // Return escrowed input.
-        o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken)));
+        // Return escrowed input, decrementing by what the token reports
+        // returning.
+        euint64 eReturned = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        o.eRemaining = FHE.sub(o.eRemaining, eReturned);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker);
 
         // Return the maker bond, if any.
         uint256 bond = o.makerBondWei;
@@ -1321,6 +1335,29 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         }
 
         emit OrderCancelled(orderId);
+    }
+
+    /// @notice Retry returning escrow that a clamped transfer left behind on a
+    ///         closed order. Maker only.
+    ///
+    /// @dev    `cancelOrder` is terminal and cannot condition on the transfer's
+    ///         encrypted result, so a delivery that clamped to 0 would otherwise
+    ///         strand the escrow forever. Idempotent: with nothing left this
+    ///         moves 0 and changes no state.
+    /// @param  orderId The closed order to sweep.
+    function claimEscrow(uint256 orderId) external nonReentrant {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+        if (!o.closed) revert OrderNotClosed();
+        if (msg.sender != o.maker) revert NotMaker();
+
+        euint64 eReturned = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        o.eRemaining = FHE.sub(o.eRemaining, eReturned);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

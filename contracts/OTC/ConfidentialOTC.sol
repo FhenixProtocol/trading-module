@@ -293,7 +293,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     uint64 public makerBondUsd = 0;
 
     /// @notice Publisher bounty after the grace window, in basis points. Default 20%.
-    uint256 public bountyBps = 2_000;
+    uint16 public bountyBps = 2_000;
 
     /// @notice Depositor-exclusive grace window for fill publishes, in seconds.
     ///         Default 10 minutes.
@@ -365,6 +365,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint64 deadline;
         /// @dev True once the bond has been settled (published or withdrawn).
         bool settled;
+        /// @dev Publisher bounty in bps, stamped at fill time so {setParams}
+        ///      stays prospective. 0 for maker records.
+        uint16 bountyBps;
     }
 
     /// @notice Order storage, keyed by order id.
@@ -461,7 +464,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  makerBondUsd  New maker bond (6-decimal USD).
     /// @param  bountyBps     New post-window publisher bounty (basis points).
     /// @param  windowSeconds New depositor-exclusive window length (seconds).
-    event ParamsUpdated(uint64 fillBondUsd, uint64 makerBondUsd, uint256 bountyBps, uint64 windowSeconds);
+    event ParamsUpdated(uint64 fillBondUsd, uint64 makerBondUsd, uint16 bountyBps, uint64 windowSeconds);
 
     /// @notice A new order was created (step 1). The order is NOT yet discoverable
     ///         or fillable — indexers should wait for {OrderActivated}.
@@ -754,7 +757,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     function setParams(
         uint64 fillBondUsd_,
         uint64 makerBondUsd_,
-        uint256 bountyBps_,
+        uint16 bountyBps_,
         uint64 windowSeconds_
     ) external onlyOwner {
         if (bountyBps_ > BPS_DENOM) revert WrongBond();
@@ -930,7 +933,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
-            settled: false
+            settled: false,
+            bountyBps: 0
         });
 
         _makerOrderIds[msg.sender].push(orderId);
@@ -1017,7 +1021,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
-            settled: false
+            settled: false,
+            bountyBps: 0
         });
 
         emit OrderToppedUp(orderId, msg.sender, seq);
@@ -1064,7 +1069,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: bond,
             deadline: uint64(block.timestamp) + windowSeconds,
-            settled: false
+            settled: false,
+            bountyBps: bountyBps
         });
 
         // Record the interaction for the taker's activity feed (set dedupes).
@@ -1219,7 +1225,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             } else {
                 // After window, live frontier → bounty to publisher, remainder
                 // to depositor.
-                uint256 bounty = (p.bondWei * bountyBps) / BPS_DENOM;
+                uint256 bounty = (p.bondWei * p.bountyBps) / BPS_DENOM;
                 if (bounty > 0) _payEth(msg.sender, bounty);
                 _payEth(p.depositor, p.bondWei - bounty);
             }
@@ -1323,12 +1329,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @return bondWei   The bond held, in wei (0 for maker records).
     /// @return deadline  The depositor-exclusive window end (0 for maker records).
     /// @return settled   Whether the bond has been settled.
+    /// @return bountyBps_ The bounty rate stamped at fill time, in bps.
     function getPublish(
         uint256 orderId,
         uint64 seq
-    ) external view returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled) {
+    )
+        external
+        view
+        returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled, uint16 bountyBps_)
+    {
         Publish storage p = _publishes[orderId][seq];
-        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled);
+        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled, p.bountyBps);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -573,6 +573,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     error OrderExpired();
     /// @notice Caller is not the order's maker.
     error NotMaker();
+    /// @notice A non-maker tried to cancel an order that has not expired.
+    error NotExpired();
     /// @notice Array argument lengths do not match.
     error LengthMismatch();
     /// @notice A bonded action was attempted before `ethOraclePrice` was set.
@@ -1232,8 +1234,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             }
 
             // Frontier rule: only a publish for the latest record changes listing.
+            // An expired order delists exactly like a depleted one — same
+            // predicate as fillOrder, so listing and fillability cannot diverge.
             if (seq == o.latestSeq) {
-                if (value != BRACKET_EMPTY) {
+                bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+                if (value != BRACKET_EMPTY && !expired) {
                     if (!o.active) {
                         bool wasPending = o.pending;
                         o.active = true;
@@ -1279,17 +1284,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Cancel an order and return the remaining escrow AND the maker
     ///         bond to the maker. Works in the pending, active, and dormant
-    ///         states. Maker only; terminal.
+    ///         states. Maker only until expiry, then anyone; terminal.
     ///
-    /// @dev    Outstanding fill Publish records survive: their depositors can
-    ///         still publish to settle and recover their bonds. The canonical
-    ///         bracket is moot once closed.
+    /// @dev    Escrow and bond always go to `o.maker`, so a third-party cancel
+    ///         of an expired order moves no value to the caller — it only frees
+    ///         a pair-index slot nothing else can. Expiry 0 stays maker-only.
+    ///         Outstanding fill Publish records survive: their depositors can
+    ///         still publish to settle and recover their bonds.
     /// @param  orderId The order to cancel.
     function cancelOrder(uint256 orderId) external nonReentrant {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
-        if (msg.sender != o.maker) revert NotMaker();
         if (o.closed) revert OrderClosed();
+
+        bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+        if (msg.sender != o.maker && !expired) revert NotExpired();
 
         bool wasActive = o.active;
         o.active = false;
@@ -1436,24 +1445,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (!ok) revert EthTransferFailed();
     }
 
-    /// @dev Converts an encrypted input amount to its USD-equivalent for
-    ///      bracket computation. Three cases, in priority order:
-    ///
-    ///   1. inputToken == fUSD  → identity (already in USD).
-    ///   2. outputToken == fUSD → use the maker's order price (Q44.20).
-    ///   3. cANY<>cANY          → use the inputToken oracle price (Q44.20).
-    ///
-    ///      An overflow cap (same pattern as fillOrder) ensures eAmount × price
-    ///      never wraps uint64. For large whale orders the cap still resolves to
-    ///      WHALE — brackets are indicators, not exact values.
+    /// @dev Converts an encrypted input amount to its USD-equivalent for bracket
+    ///      computation, always at the input leg's oracle price — never at the
+    ///      maker-supplied `o.price`, which is unbounded and, since the cap below
+    ///      is inversely tied to the rate, let a maker publish a one-unit order
+    ///      as WHALE. The cap keeps eAmount × price inside uint64.
     /// @param  eAmount The encrypted input-token amount to value.
-    /// @param  o       The order whose legs/price select the conversion path.
+    /// @param  o       The order whose input leg selects the oracle price.
     /// @return The encrypted USD-equivalent (6-decimal fUSD units).
     function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
-        if (address(o.inputToken) == address(fUSD)) return eAmount;
-
-        uint64 convPrice =
-            (address(o.outputToken) == address(fUSD)) ? o.price : _tokenConfig[address(o.inputToken)].oraclePrice;
+        uint64 convPrice = _tokenConfig[address(o.inputToken)].oraclePrice;
+        if (convPrice == Q_DENOM) return eAmount;
 
         uint64 maxSafe = type(uint64).max / convPrice;
         euint64 eSafe = FHE.min(eAmount, FHE.asEuint64(maxSafe));

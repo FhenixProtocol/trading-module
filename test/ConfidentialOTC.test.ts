@@ -1728,7 +1728,7 @@ describe("ConfidentialOTC", () => {
         fusdAddr,
         PRICE_BTC_FUSD,
         0n,
-        await enc(aliceClient, mBTC),
+        ...(await enc(aliceClient, mBTC, otc)),
       );
 
       await advance(TWO_DAYS + 1);
@@ -1737,7 +1737,15 @@ describe("ConfidentialOTC", () => {
       // Both the maker and the taker path stay open. This is the regression
       // guard: an earlier revision reverted here, which meant a quiet keeper
       // halted every fill on every pair.
-      const id2 = await createOrder(otc, alice, ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, await enc(aliceClient, mBTC));
+      const id2 = await createOrder(
+        otc,
+        alice,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
       expect(id2).to.equal(id + 1n);
 
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
@@ -1903,7 +1911,7 @@ describe("ConfidentialOTC", () => {
         fusdAddr,
         PRICE_BTC_FUSD,
         0n,
-        await enc(aliceClient, mBTC),
+        ...(await enc(aliceClient, mBTC, otc)),
       );
 
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
@@ -1937,7 +1945,7 @@ describe("ConfidentialOTC", () => {
         fusdAddr,
         PRICE_BTC_FUSD,
         0n,
-        await enc(aliceClient, mBTC),
+        ...(await enc(aliceClient, mBTC, otc)),
       );
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
       await expectBalance(ecbtc, bob.address, mBTC);

@@ -58,6 +58,7 @@ const ONE = 1_000_000n; // 1 whole token at 6 decimals
 const EMPTY = 0n;
 const NANO = 1n;
 const SMALL = 2n;
+const LARGE = 4n;
 const UNPUBLISHED = 255n;
 
 // ── Realistic oracle prices (Q44.20: floor(usd_per_whole_token × 2^20)) ───────
@@ -962,9 +963,7 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).pause()).wait();
 
       await expect(
-        otc
-          .connect(alice)
-          .createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
+        otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
       ).to.be.revertedWithCustomError(otc, "EnforcedPause");
     });
 
@@ -1256,6 +1255,35 @@ describe("ConfidentialOTC", () => {
       );
       return { ...ctx, id };
     }
+
+    // The oracle price is per WHOLE token, so `raw × price >> 20` is only in 6-decimal fUSD
+    // units when the input token has 6 decimals. A 4-decimal token must be rescaled by
+    // 10^(6 − 4): 0.2 ec4 at $65,000 is $13,000 (LARGE). Unscaled it reads as $130 (SMALL).
+    it("brackets a 4-decimal input token at its true USD notional (LARGE, not SMALL)", async () => {
+      const { deployer, alice, fusd, otc, aliceClient, otcAddr, ecethAddr } = await setup();
+      const ec4 = (await ethers.deployContract("FHERC20_Harness", [
+        "Four",
+        "EC4",
+        4,
+        "",
+      ])) as unknown as ConfidentialToken;
+      await ec4.waitForDeployment();
+      const ec4Addr = await ec4.getAddress();
+      await (await otc.connect(deployer).whitelistToken(ec4Addr, ORACLE_ECBTC)).wait(); // $65,000 per whole ec4
+
+      await fundMaker(alice, ec4, 10_000n, fusd, 0n, otcAddr); // 1 whole ec4 at 4 decimals
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ec4Addr,
+        ecethAddr,
+        PRICE_BTC_ETH,
+        0n,
+        ...(await enc(aliceClient, 2_000n, otc)), // 0.2 ec4
+      );
+      expect((await otc.getOrder(id)).bracket).to.equal(LARGE); // 2_000 × $65,000 × 10^(6−4) >> 20 = $13,000
+    });
 
     it("creates a cANY<>cANY order; bracket uses oracle price for inputToken", async () => {
       const { otc, ecbtcAddr, ecethAddr, id } = await withCanyOrder();
@@ -1783,9 +1811,7 @@ describe("ConfidentialOTC", () => {
         otc,
         "OwnableUnauthorizedAccount",
       );
-      await expect(otc.connect(deployer).setMaxPriceAge(3_600n))
-        .to.emit(otc, "MaxPriceAgeUpdated")
-        .withArgs(3_600n);
+      await expect(otc.connect(deployer).setMaxPriceAge(3_600n)).to.emit(otc, "MaxPriceAgeUpdated").withArgs(3_600n);
       expect(await otc.maxPriceAge()).to.equal(3_600n);
     });
 

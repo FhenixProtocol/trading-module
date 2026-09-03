@@ -76,8 +76,10 @@ const mBTC = ONE / 1_000n; // 0.001 ecBTC = 1_000 raw → $65 at oracle → NANO
 const FILL_1MBTC_FUSD = 65n * ONE; // 1_000 raw ecBTC → 65_000_000 fUSD ($65)
 const FILL_400RAW_FUSD = 26n * ONE; // 400   raw ecBTC → 26_000_000 fUSD ($26)
 const FILL_200RAW_FUSD = 13n * ONE; // 200   raw ecBTC → 13_000_000 fUSD ($13)
-const FILL_1MBTC_ETH = 18_571n; // 1_000 raw ecBTC → 18_571 raw ecETH
-const FILL_400RAW_ETH = 7_428n; // 400   raw ecBTC → 7_428  raw ecETH
+// PRICE_BTC_ETH is not a multiple of 2^20, so the exact costs (18_571.43 and
+// 7_428.57) carry a residue; the taker pays the ceiling, so the maker keeps it.
+const FILL_1MBTC_ETH = 18_572n; // 1_000 raw ecBTC → 18_572 raw ecETH
+const FILL_400RAW_ETH = 7_429n; // 400   raw ecBTC → 7_429  raw ecETH
 
 describe("ConfidentialOTC", () => {
   before(async () => {
@@ -450,7 +452,9 @@ describe("ConfidentialOTC", () => {
 
     it("owner can set the oracle address", async () => {
       const { deployer, bob, otc } = await setup();
-      await (await otc.connect(deployer).setOracle(bob.address)).wait();
+      await expect(otc.connect(deployer).setOracle(bob.address))
+        .to.emit(otc, "OracleUpdated")
+        .withArgs(ethers.ZeroAddress, bob.address);
       expect(await otc.oracle()).to.equal(bob.address);
     });
 
@@ -625,6 +629,28 @@ describe("ConfidentialOTC", () => {
       );
       await expectBalance(fusd, otcAddr, 200n * ONE); // no cleanup fee anymore
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
+    });
+
+    it("brackets from the oracle, so a maker cannot inflate their own size via price", async () => {
+      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      // The bracket rate used to come from o.price on cANY→fUSD orders. At
+      // uint64.max the overflow cap collapses to 1, so 1 raw unit multiplied
+      // out to 17_592_186_044_415 ($17.6M) — 176x the WHALE floor. Sourcing
+      // the rate from the ecBTC oracle values it at what it is: $0.000065.
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        (1n << 64n) - 1n,
+        0n,
+        ...(await enc(aliceClient, 1n, otc)),
+      );
+
+      expect((await otc.getOrder(id)).bracket).to.equal(NANO);
     });
 
     it("reverts on zero address, same leg, zero price, and bad expiry", async () => {
@@ -810,6 +836,233 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // delisted token — trading halts, unwinding does not
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("delisted token", () => {
+    /// Active ecBTC → fUSD order, ready for a leg to be delisted under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("blocks fills when the escrowed leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("blocks fills when the requested leg is delisted", async () => {
+      const { deployer, bob, otc, bobClient, fusdAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(fusdAddr)).wait();
+
+      // Either direction moves the delisted token to a new holder for value,
+      // so both legs gate — not just the one sitting in escrow.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(fusdAddr);
+    });
+
+    it("blocks top-ups, so a delisted order cannot grow", async () => {
+      const { deployer, alice, otc, aliceClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await expect(otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the delist", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond is posted while the token is still tradable, then the token is
+      // delisted underneath it. Gating publishBracket here would strand the ETH.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // pause — the contract-scoped twin of delistToken
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("pause", () => {
+    /// Active ecBTC → fUSD order, ready for the contract to be paused under it.
+    async function withOrder() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("only the owner can pause or unpause", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      await expect(otc.connect(alice).pause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      await (await otc.connect(deployer).pause()).wait();
+      await expect(otc.connect(alice).unpause()).to.be.revertedWithCustomError(otc, "OwnableUnauthorizedAccount");
+      expect(await otc.paused()).to.equal(true);
+    });
+
+    it("blocks new orders while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc
+          .connect(alice)
+          .createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks fills while paused, on a pair whose legs are both still whitelisted", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      // Nothing is delisted here — the halt is contract-scoped, which is the
+      // whole point of having pause alongside delistToken.
+      const bond = await otc.ethBondSize();
+      await expect(
+        otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("blocks top-ups while paused", async () => {
+      const { deployer, alice, otc, aliceClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await expect(
+        otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 500n, otc))),
+      ).to.be.revertedWithCustomError(otc, "EnforcedPause");
+    });
+
+    it("still lets the maker cancel and recover escrow", async () => {
+      const { deployer, alice, otc, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+
+      await (await otc.connect(alice).cancelOrder(id)).wait();
+      const view = await otc.getOrder(id);
+      expect(view.closed).to.equal(true);
+      expect(view.active).to.equal(false);
+    });
+
+    it("still lets a taker publish and recover a bond posted before the pause", async () => {
+      const { deployer, bob, otc, bobClient, otcAddr, id } = await withOrder();
+      const bond = await otc.ethBondSize();
+
+      // Bond posted while trading is open, then the contract is paused under
+      // it. Gating publishBracket here would strand the ETH for the length of
+      // the pause — which, for a migration, is indefinite.
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond);
+
+      await (await otc.connect(deployer).pause()).wait();
+
+      await publish(otc, bob, bobClient, id, seq);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      expect((await otc.getPublish(id, seq)).settled).to.equal(true);
+    });
+
+    it("still lets a pending order activate while paused", async () => {
+      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      // Created (escrow already moved) but not yet activated when the pause
+      // lands. activateOrder is a publish, not an entry — it must stay open so
+      // the order reaches a state the maker can reason about and cancel from.
+      const id = await createOrder(
+        otc,
+        alice,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      await (await otc.connect(deployer).pause()).wait();
+
+      await activate(otc, alice, aliceClient, id);
+      expect((await otc.getOrder(id)).active).to.equal(true);
+    });
+
+    it("restores trading on unpause", async () => {
+      const { deployer, bob, otc, bobClient, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+      expect(await otc.paused()).to.equal(false);
+
+      expect(await fillAndPublish(otc, bob, bobClient, id, 400n)).to.equal(NANO);
+    });
+
+    it("unpausing does not re-list a token delisted while paused", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder();
+      await (await otc.connect(deployer).pause()).wait();
+      await (await otc.connect(deployer).delistToken(ecbtcAddr)).wait();
+      await (await otc.connect(deployer).unpause()).wait();
+
+      // The two levers are independent: lifting the contract-scoped halt must
+      // not lift the asset-scoped one.
+      const bond = await otc.ethBondSize();
+      await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
+        .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
+        .withArgs(ecbtcAddr);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // fill bond, window, bounty
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -930,6 +1183,50 @@ describe("ConfidentialOTC", () => {
         otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
       ).to.changeEtherBalances([bob, deployer], [bond, 0n], { includeFee: false });
       expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+    });
+
+    it("settles on the bounty rate stamped at fill time, not the live one", async () => {
+      const { deployer, bob, otc, bobClient, id, seq } = await withFilledOrder();
+      const bond = await otc.ethBondSize();
+      const bounty = (bond * 2_000n) / 10_000n;
+
+      // The rate in force at fill time is recorded on the bond itself.
+      expect((await otc.getPublish(id, seq)).bountyBps_).to.equal(2_000n);
+
+      // Owner raises the bounty to 100% while the bond is outstanding, then
+      // publishes it themselves — the seizure the live read would have allowed.
+      await (await otc.connect(deployer).setParams(5_000_000n, 0n, 10_000n, 600n)).wait();
+      expect(await otc.bountyBps()).to.equal(10_000n);
+
+      await hre.network.provider.send("evm_increaseTime", [601]);
+      await hre.network.provider.send("evm_mine");
+
+      // The stamped 20% still governs: the depositor keeps the other 80%.
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(bobClient, rec.handle);
+      await expect(
+        otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
+      ).to.changeEtherBalances([bob, deployer], [bond - bounty, bounty], { includeFee: false });
+    });
+
+    it("cannot strand an in-flight keeper publish by zeroing the bounty", async () => {
+      const { deployer, bob, otc, bobClient, id, seq } = await withFilledOrder();
+      const bond = await otc.ethBondSize();
+      const bounty = (bond * 2_000n) / 10_000n;
+
+      await hre.network.provider.send("evm_increaseTime", [601]);
+      await hre.network.provider.send("evm_mine");
+
+      // Owner zeroes the bounty after the keeper has committed to publishing.
+      await (await otc.connect(deployer).setParams(5_000_000n, 0n, 0n, 600n)).wait();
+      expect(await otc.bountyBps()).to.equal(0n);
+
+      // The keeper is still paid the rate the record was posted under.
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(bobClient, rec.handle);
+      await expect(
+        otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
+      ).to.changeEtherBalances([bob, deployer], [bond - bounty, bounty], { includeFee: false });
     });
   });
 
@@ -1225,11 +1522,46 @@ describe("ConfidentialOTC", () => {
       ).to.be.revertedWithCustomError(otc, "WrongBond");
     });
 
-    it("only the maker can cancel; cannot cancel twice", async () => {
-      const { alice, bob, otc, id } = await withOrder();
-      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotMaker");
+    it("only the maker can cancel an unexpired order; cannot cancel twice", async () => {
+      const { alice, bob, otc, id } = await withOrder(); // good-til-cancelled
+      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotExpired");
       await (await otc.connect(alice).cancelOrder(id)).wait();
       await expect(otc.connect(alice).cancelOrder(id)).to.be.revertedWithCustomError(otc, "OrderClosed");
+    });
+
+    it("anyone may retire an expired order, and the escrow still returns to the maker", async () => {
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      // Before expiry the order is maker-only, as always.
+      await expect(otc.connect(bob).cancelOrder(id)).to.be.revertedWithCustomError(otc, "NotExpired");
+
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // bob is unrelated to the order. He can retire it, but the escrow is
+      // hardcoded to o.maker — alice gets every unit back and the OTC is left
+      // empty, so nothing reached the caller.
+      await expect(otc.connect(bob).cancelOrder(id)).to.emit(otc, "OrderCancelled");
+      await expectBalance(ecbtc, alice.address, ONE);
+      await expectBalance(ecbtc, otcAddr, 0n);
+
+      const order = await otc.getOrder(id);
+      expect(order.closed).to.equal(true);
+      expect(order.active).to.equal(false);
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
     });
 
     it("a cancelled order cannot be filled", async () => {
@@ -1365,6 +1697,370 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(false);
       expect(order.closed).to.equal(true);
+    });
+
+    it("delists on the next publish once expired, instead of staying listed", async () => {
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, 2n * mBTC, otc)),
+      );
+
+      // A fill lands while the order is still live, leaving an unsettled record.
+      const seq = await fill(otc, bob, bobClient, id, 200n);
+      expect((await otc.getOrder(id)).active).to.equal(true);
+
+      // Expiry passes before the taker publishes it.
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // The bracket is still non-EMPTY (escrow remains), so the old frontier
+      // rule kept the order listed and unfillable. It now delists on expiry.
+      const value = await publish(otc, bob, bobClient, id, seq);
+      expect(value).to.not.equal(EMPTY);
+
+      const order = await otc.getOrder(id);
+      expect(order.active).to.equal(false);
+      expect(order.closed).to.equal(false); // dormant, not destroyed — escrow retained
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC - 200n);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // oracle staleness & the Chainlink ETH/USD feed
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("oracle staleness", () => {
+    const TWO_DAYS = 172_800;
+    const FEED_DECIMALS = 8n;
+    const FEED_ONE = 10n ** FEED_DECIMALS;
+    const ETH_USD = 3_500n * FEED_ONE; // $3,500 / ETH, 8-decimal Chainlink scale
+
+    async function advance(seconds: number) {
+      await hre.network.provider.send("evm_increaseTime", [seconds]);
+      await hre.network.provider.send("evm_mine");
+    }
+
+    async function deployFeed(answer: bigint = ETH_USD, decimals: bigint = FEED_DECIMALS) {
+      const feed = await ethers.deployContract("MockAggregatorV3", [decimals, answer]);
+      await feed.waitForDeployment();
+      return feed;
+    }
+
+    // ── pushed-price path (no feed configured) ────────────────────────────
+
+    it("stamps ethPriceUpdatedAt on every push", async () => {
+      const { deployer, otc } = await setup();
+
+      const first = await otc.ethPriceUpdatedAt();
+      expect(first).to.be.greaterThan(0n);
+      expect(await otc.isEthPriceStale()).to.equal(false);
+
+      await advance(100);
+      await (await otc.connect(deployer).setEthOraclePrice(ORACLE_ECETH)).wait();
+      expect(await otc.ethPriceUpdatedAt()).to.be.greaterThan(first);
+    });
+
+    it("defaults to a 2-day staleness window, owner-settable", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      expect(await otc.maxPriceAge()).to.equal(BigInt(TWO_DAYS));
+
+      await expect(otc.connect(alice).setMaxPriceAge(3_600n)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(otc.connect(deployer).setMaxPriceAge(3_600n))
+        .to.emit(otc, "MaxPriceAgeUpdated")
+        .withArgs(3_600n);
+      expect(await otc.maxPriceAge()).to.equal(3_600n);
+    });
+
+    it("reports a stale pushed price but keeps sizing bonds off it", async () => {
+      const { deployer, otc } = await setup();
+
+      const fresh = await otc.ethBondSize();
+      expect(fresh).to.be.greaterThan(0n);
+
+      await advance(TWO_DAYS + 1);
+
+      // Staleness is advisory: flagged for monitoring, never enforced. Halting
+      // the venue to avoid mis-sizing a $5 refundable deposit is the wrong trade.
+      expect(await otc.isEthPriceStale()).to.equal(true);
+      expect(await otc.ethBondSize()).to.equal(fresh);
+
+      await (await otc.connect(deployer).setEthOraclePrice(ORACLE_ECETH)).wait();
+      expect(await otc.isEthPriceStale()).to.equal(false);
+    });
+
+    it("keeps fills working through a fully stale oracle", async () => {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      await advance(TWO_DAYS + 1);
+      expect(await otc.isEthPriceStale()).to.equal(true);
+
+      // Both the maker and the taker path stay open. This is the regression
+      // guard: an earlier revision reverted here, which meant a quiet keeper
+      // halted every fill on every pair.
+      const id2 = await createOrder(
+        otc,
+        alice,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      expect(id2).to.equal(id + 1n);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+      await expectBalance(ecbtc, bob.address, mBTC);
+    });
+
+    it("skips price resolution entirely when bonds are zero", async () => {
+      const { deployer, otc } = await setup();
+
+      await (await otc.connect(deployer).setParams(0n, 0n, 2_000n, 600n)).wait();
+      await advance(TWO_DAYS + 1);
+
+      expect(await otc.isEthPriceStale()).to.equal(true);
+      expect(await otc.ethBondSize()).to.equal(0n);
+      expect(await otc.makerBondSize()).to.equal(0n);
+    });
+
+    it("maxPriceAge = 0 disables staleness checks", async () => {
+      const { deployer, otc, ecbtcAddr } = await setup();
+
+      await (await otc.connect(deployer).setMaxPriceAge(0n)).wait();
+      await advance(TWO_DAYS * 10);
+
+      expect(await otc.isEthPriceStale()).to.equal(false);
+      expect(await otc.isPriceStale(ecbtcAddr)).to.equal(false);
+      expect(await otc.ethBondSize()).to.be.greaterThan(0n);
+    });
+
+    // ── Chainlink feed path ────────────────────────────────────────────────
+
+    it("reads the feed live once configured, ignoring the pushed price", async () => {
+      const { deployer, otc } = await setup();
+      const feed = await deployFeed();
+
+      await expect(otc.connect(deployer).setEthUsdFeed(await feed.getAddress()))
+        .to.emit(otc, "EthUsdFeedUpdated")
+        .withArgs(await feed.getAddress());
+
+      // $3,500 → Q44.20. Same price the push oracle held, so the bond matches.
+      expect(await otc.ethUsdPriceQ20()).to.equal(3_500n * Q);
+      const bondAt3500 = await otc.ethBondSize();
+
+      // Move the feed only. No owner call, no keeper — the next read picks it up.
+      await (await feed.setAnswer(7_000n * FEED_ONE)).wait();
+      expect(await otc.ethUsdPriceQ20()).to.equal(7_000n * Q);
+
+      // ETH doubled, so a $5 bond costs half as much ETH.
+      expect(await otc.ethBondSize()).to.equal(bondAt3500 / 2n);
+
+      // The pushed price is now irrelevant.
+      await (await otc.connect(deployer).setEthOraclePrice(1n * Q)).wait();
+      expect(await otc.ethUsdPriceQ20()).to.equal(7_000n * Q);
+    });
+
+    it("only the owner may set the feed", async () => {
+      const { deployer, alice, otc } = await setup();
+      const feed = await deployFeed();
+
+      await expect(otc.connect(alice).setEthUsdFeed(await feed.getAddress())).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+      expect(await otc.ethUsdFeed()).to.equal(await feed.getAddress());
+    });
+
+    it("takes the scale from the feed, so any decimals work", async () => {
+      const { deployer, otc } = await setup();
+
+      // Same $3,500 expressed at three different feed scales must all resolve
+      // to the same Q44.20 price — nothing here assumes 8 decimals.
+      for (const dec of [6n, 8n, 18n]) {
+        const feed = await deployFeed(3_500n * 10n ** dec, dec);
+        await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+        expect(await otc.ethUsdPriceQ20()).to.equal(3_500n * Q);
+      }
+    });
+
+    it("rejects feed answers that cannot be used as a divisor", async () => {
+      const { deployer, otc } = await setup();
+      const feed = await deployFeed();
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+
+      // Non-positive: casting a negative answer would overflow the multiply.
+      await (await feed.setAnswer(0n)).wait();
+      await expect(otc.ethBondSize()).to.be.revertedWithCustomError(otc, "BadOraclePrice");
+      await (await feed.setAnswer(-1n)).wait();
+      await expect(otc.ethBondSize()).to.be.revertedWithCustomError(otc, "BadOraclePrice");
+
+      // Truncates to zero in Q44.20 (answer × 2^20 / 1e8 == 0 below ~96), which
+      // would divide by zero in _usdToWei.
+      await (await feed.setAnswer(95n)).wait();
+      await expect(otc.ethBondSize()).to.be.revertedWithCustomError(otc, "BadOraclePrice");
+
+      // One tick above the threshold resolves fine.
+      await (await feed.setAnswer(96n)).wait();
+      expect(await otc.ethUsdPriceQ20()).to.equal(1n);
+    });
+
+    it("reports a quiet feed as stale from the feed's own timestamp", async () => {
+      const { deployer, otc } = await setup();
+      const feed = await deployFeed();
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+
+      const before = await otc.ethBondSize();
+      expect(before).to.be.greaterThan(0n);
+      expect(await otc.isEthPriceStale()).to.equal(false);
+
+      // Feed stops updating. Reported, not enforced — fills keep working.
+      await advance(TWO_DAYS + 1);
+      expect(await otc.isEthPriceStale()).to.equal(true);
+      expect(await otc.ethBondSize()).to.equal(before);
+
+      // A fresh round clears it, with no owner involvement.
+      await (await feed.setAnswer(ETH_USD)).wait();
+      expect(await otc.isEthPriceStale()).to.equal(false);
+    });
+
+    it("isEthPriceStale follows the feed, not the pushed timestamp", async () => {
+      const { deployer, otc } = await setup();
+      const feed = await deployFeed();
+
+      // Feed fresh, pushed price ancient → not stale (the feed is what's used).
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+      await advance(TWO_DAYS + 1);
+      await (await feed.setAnswer(ETH_USD)).wait();
+      expect(await otc.isEthPriceStale()).to.equal(false);
+
+      // Drop back to the pushed price, which is now ancient → stale.
+      await (await otc.connect(deployer).setEthUsdFeed(ethers.ZeroAddress)).wait();
+      expect(await otc.isEthPriceStale()).to.equal(true);
+    });
+
+    it("falls back to the pushed price when the feed is unset", async () => {
+      const { deployer, otc } = await setup();
+      const feed = await deployFeed(7_000n * FEED_ONE);
+
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+      expect(await otc.ethUsdPriceQ20()).to.equal(7_000n * Q);
+
+      await (await otc.connect(deployer).setEthUsdFeed(ethers.ZeroAddress)).wait();
+      expect(await otc.ethUsdFeed()).to.equal(ethers.ZeroAddress);
+      expect(await otc.ethUsdPriceQ20()).to.equal(ORACLE_ECETH); // pushed $3,500
+    });
+
+    it("prices a real fill bond off the feed end to end", async () => {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      const feed = await deployFeed();
+      await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+      await expectBalance(ecbtc, bob.address, mBTC);
+    });
+
+    // ── per-token bracket prices (advisory only) ──────────────────────────
+
+    it("flags stale token prices as advisory only — fills still work", async () => {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      await advance(TWO_DAYS + 1);
+      expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
+
+      // Refresh only the bond feed; ecBTC's bracket price stays stale.
+      await (await otc.connect(deployer).setEthOraclePrice(ORACLE_ECETH)).wait();
+      expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
+
+      // create → activate → fill all still run. A stale bracket price mis-sorts
+      // the book at worst; it must never strand an order.
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+      await expectBalance(ecbtc, bob.address, mBTC);
+    });
+
+    it("never reports fUSD as stale — it is the pinned unit of account", async () => {
+      const { otc, fusdAddr, ecbtcAddr } = await setup();
+
+      await advance(TWO_DAYS * 5);
+
+      expect(await otc.isPriceStale(fusdAddr)).to.equal(false);
+      expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
+    });
+
+    it("reports price age, and 0 for a token that was never priced", async () => {
+      const { otc, ecbtcAddr } = await setup();
+
+      expect(await otc.priceAge(ethers.Wallet.createRandom().address)).to.equal(0n);
+
+      await advance(1_000);
+      expect(await otc.priceAge(ecbtcAddr)).to.be.greaterThanOrEqual(1_000n);
     });
   });
 });

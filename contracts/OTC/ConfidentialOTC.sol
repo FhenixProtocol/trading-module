@@ -2,10 +2,12 @@
 pragma solidity ^0.8.27;
 
 import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
+import { Pausable } from '@openzeppelin/contracts/utils/Pausable.sol';
 import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import { FHE, euint64, euint8, ebool, externalEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
 import { IFHERC20 } from '../interfaces/IFHERC20.sol';
+import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 
 /// @title  ConfidentialOTC
 /// @author Rogue Rotkosky, Fhenix
@@ -105,6 +107,21 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 /// designated `oracle` address (or the owner).
 ///
 /// ──────────────────────────────────────────────────────────────────────────
+/// Halting: delist (asset-scoped) vs. pause (contract-scoped)
+/// ──────────────────────────────────────────────────────────────────────────
+///
+/// Two owner levers halt trading, differently scoped: `delistToken` clears one
+/// token's whitelist flag, making that token's orders cancel-only while every
+/// other pair keeps trading (the lever for a bad *asset*), and `pause` stops
+/// every pair at once (the lever for a bad *contract*, or a migration). Both
+/// gate only the paths that OPEN or INCREASE exposure — `createOrder`,
+/// `fillOrder`, `topUpOrder`. Unwinding is never gated: `cancelOrder`,
+/// `activateOrder` and `publishBracket` stay callable under both, so a halt
+/// never strands escrow or an already-posted bond. A fill is not an unwind —
+/// it hands the halted asset to a new holder at an `o.price` fixed at
+/// `createOrder` and never repriceable.
+///
+/// ──────────────────────────────────────────────────────────────────────────
 /// Order model
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -166,7 +183,7 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 ///   5 = WHALE    ≥ $100 000
 ///   255 = UNPUBLISHED  sentinel before the first reveal (pending orders)
 ///
-contract ConfidentialOTC is Ownable, ReentrancyGuard {
+contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -239,6 +256,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @dev Precomputed encrypted zero, reused for comparisons and fallbacks.
     euint64 private immutable _E_ZERO64;
 
+    /// @dev Q_DENOM - 1, added before the Q44.20 right-shift so the taker's
+    ///      obligation rounds up instead of down. See {_swap}.
+    euint64 private immutable _E_Q_MASK;
+
     // ─────────────────────────────────────────────────────────────────────────
     // Token whitelist & oracle
     // ─────────────────────────────────────────────────────────────────────────
@@ -266,6 +287,25 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     ///         before any bonded action whose USD size is non-zero.
     uint64 public ethOraclePrice;
 
+    /// @notice Timestamp of the last {setEthOraclePrice}. 0 while unset.
+    /// @dev    The companion `TokenConfig.priceUpdatedAt` already existed for the
+    ///         cosmetic per-token feed; this mirrors it for the feed that
+    ///         actually sizes funds, so bond pricing can detect "configured but
+    ///         stale" rather than only "never configured". Only consulted on the
+    ///         fallback path — when {ethUsdFeed} is set, Chainlink's own
+    ///         `updatedAt` is the staleness clock.
+    uint64 public ethPriceUpdatedAt;
+
+    /// @notice Chainlink ETH/USD feed. When set it is the authoritative source
+    ///         for bond sizing and {ethOraclePrice} is ignored. Zero address
+    ///         falls back to the pushed price.
+    /// @dev    Only the bond path reads a feed. Per-token *bracket* prices stay
+    ///         pushed: the whitelisted set is confidential wrappers with no
+    ///         canonical feeds, and brackets are decade-wide buckets where a
+    ///         ~15k-gas external read on an already FHE-heavy path buys nothing.
+    AggregatorV3Interface public ethUsdFeed;
+
+
     // ─────────────────────────────────────────────────────────────────────────
     // Governable bond / window parameters
     // ─────────────────────────────────────────────────────────────────────────
@@ -277,11 +317,20 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     uint64 public makerBondUsd = 0;
 
     /// @notice Publisher bounty after the grace window, in basis points. Default 20%.
-    uint256 public bountyBps = 2_000;
+    uint16 public bountyBps = 2_000;
 
     /// @notice Depositor-exclusive grace window for fill publishes, in seconds.
     ///         Default 10 minutes.
     uint64 public windowSeconds = 600;
+
+    /// @notice Maximum age an oracle price may reach before it counts as stale.
+    ///         Default 2 days. 0 disables staleness checks entirely.
+    /// @dev    Enforced as a hard revert only on the ETH/bond path ({_usdToWei}),
+    ///         where a drifting price mis-sizes real funds. For per-token bracket
+    ///         prices it is advisory — see {isPriceStale} — because brackets are
+    ///         decade-wide buckets and reverting fills over a slightly old price
+    ///         would strand orders for no safety gain.
+    uint64 public maxPriceAge = 2 days;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -340,6 +389,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint64 deadline;
         /// @dev True once the bond has been settled (published or withdrawn).
         bool settled;
+        /// @dev Publisher bounty in bps, stamped at fill time so {setParams}
+        ///      stays prospective. 0 for maker records.
+        uint16 bountyBps;
     }
 
     /// @notice Order storage, keyed by order id.
@@ -409,9 +461,14 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  oraclePrice The initial Q44.20 oracle price assigned to it.
     event TokenWhitelisted(address indexed token, uint64 oraclePrice);
 
-    /// @notice A token was removed from the whitelist (existing orders are unaffected).
+    /// @notice A token was removed from the whitelist; its orders are cancel-only.
     /// @param  token The delisted token.
     event TokenDelisted(address indexed token);
+
+    /// @notice The address holding the oracle role was changed.
+    /// @param  previousOracle The address that held the role (0 if disabled).
+    /// @param  newOracle      The address that now holds it (0 disables it).
+    event OracleUpdated(address indexed previousOracle, address indexed newOracle);
 
     /// @notice A whitelisted token's bracket oracle price was updated.
     /// @param  token       The token whose price changed.
@@ -422,12 +479,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  oraclePrice The new Q44.20 USD-per-ETH price.
     event EthOraclePriceUpdated(uint64 oraclePrice);
 
+    /// @notice The oracle staleness window was changed.
+    /// @param  maxPriceAge The new maximum price age in seconds (0 = disabled).
+    event MaxPriceAgeUpdated(uint64 maxPriceAge);
+
+    /// @notice The Chainlink ETH/USD feed used for bond sizing was changed.
+    /// @param  feed The new aggregator, or address(0) to fall back to the
+    ///              pushed `ethOraclePrice`.
+    event EthUsdFeedUpdated(address indexed feed);
+
     /// @notice The governable bond / window parameters were retuned.
     /// @param  fillBondUsd   New taker fill bond (6-decimal USD).
     /// @param  makerBondUsd  New maker bond (6-decimal USD).
     /// @param  bountyBps     New post-window publisher bounty (basis points).
     /// @param  windowSeconds New depositor-exclusive window length (seconds).
-    event ParamsUpdated(uint64 fillBondUsd, uint64 makerBondUsd, uint256 bountyBps, uint64 windowSeconds);
+    event ParamsUpdated(uint64 fillBondUsd, uint64 makerBondUsd, uint16 bountyBps, uint64 windowSeconds);
 
     /// @notice A new order was created (step 1). The order is NOT yet discoverable
     ///         or fillable — indexers should wait for {OrderActivated}.
@@ -511,14 +577,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error OrderNotActive();
     /// @notice The order has been cancelled (terminal).
     error OrderClosed();
+    /// @notice The order is still open, so there is no leftover escrow to claim.
+    error OrderNotClosed();
     /// @notice The order is past its expiry timestamp.
     error OrderExpired();
     /// @notice Caller is not the order's maker.
     error NotMaker();
+    /// @notice A non-maker tried to cancel an order that has not expired.
+    error NotExpired();
     /// @notice Array argument lengths do not match.
     error LengthMismatch();
     /// @notice A bonded action was attempted before `ethOraclePrice` was set.
     error EthOracleUnset();
+    /// @notice The Chainlink feed returned an answer that cannot be used as a
+    ///         divisor: non-positive, or out of Q44.20 range.
+    error BadOraclePrice();
     /// @notice msg.value did not cover the required bond, or bountyBps > BPS_DENOM.
     error WrongBond();
     /// @notice No publish record exists for the given (orderId, seq).
@@ -569,6 +642,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
         _E_SHR_20 = FHE.asEuint64(20);
         _E_ZERO64 = FHE.asEuint64(0);
+        _E_Q_MASK = FHE.asEuint64(Q_DENOM - 1);
 
         // Persist ACL on every reused handle so they remain usable as operands
         // in later transactions (the auto-grant from FHE.asEuint* is transient).
@@ -584,6 +658,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(_LARGE_MAX);
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
+        FHE.allowThis(_E_Q_MASK);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -621,9 +696,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         return IFHERC20(token).decimals();
     }
 
-    /// @notice Remove a token from the whitelist.
-    /// @dev    Existing orders for this token are unaffected; only new orders
-    ///         are blocked.
+    /// @notice Remove a token from the whitelist, halting trading in it.
+    /// @dev    Blocks createOrder, fillOrder and topUpOrder on either leg.
+    ///         Existing orders become cancel-only: cancelOrder and
+    ///         publishBracket stay open so escrow and bonds can be recovered.
     /// @param  token The token to delist.
     function delistToken(address token) external onlyOwner {
         _tokenConfig[token].whitelisted = false;
@@ -633,7 +709,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @notice Set the oracle address. Zero address disables the oracle role.
     /// @param  oracle_ The new oracle address (or address(0) to disable).
     function setOracle(address oracle_) external onlyOwner {
+        address previousOracle = oracle;
         oracle = oracle_;
+        emit OracleUpdated(previousOracle, oracle_);
     }
 
     /// @notice Update the Q44.20 oracle price for a whitelisted token.
@@ -657,7 +735,71 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         if (msg.sender != oracle && msg.sender != owner()) revert Unauthorized();
         if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
         ethOraclePrice = price;
+        ethPriceUpdatedAt = uint64(block.timestamp);
         emit EthOraclePriceUpdated(price);
+    }
+
+    /// @notice Set the staleness window for oracle prices. Owner only.
+    /// @dev    Passing 0 disables staleness checks — an operational lever for
+    ///         oracle migrations. The owner can also simply push a fresh price,
+    ///         since {setEthOraclePrice} accepts the owner as well as the oracle.
+    /// @param  maxPriceAge_ The new maximum price age, in seconds (0 = disabled).
+    function setMaxPriceAge(uint64 maxPriceAge_) external onlyOwner {
+        maxPriceAge = maxPriceAge_;
+        emit MaxPriceAgeUpdated(maxPriceAge_);
+    }
+
+    /// @notice Point bond sizing at a Chainlink ETH/USD feed. Owner only.
+    ///
+    /// @dev    This is one-time *configuration*, not a price push: it records
+    ///         which aggregator to read. Once set, every {_usdToWei} — so every
+    ///         `fillOrder` and every bonded `createOrder` — reads the live
+    ///         answer straight from Chainlink. No keeper, no cron, no further
+    ///         owner involvement, and {ethOraclePrice} stops being consulted.
+    ///
+    ///         Pass address(0) to fall back to the pushed price (a deprecated
+    ///         feed, or a chain that has none).
+    ///
+    /// @param  feed The Chainlink aggregator, or address(0) to disable.
+    function setEthUsdFeed(AggregatorV3Interface feed) external onlyOwner {
+        ethUsdFeed = feed;
+        emit EthUsdFeedUpdated(address(feed));
+    }
+
+    /// @notice The ETH/USD price bond sizing will use right now, in Q44.20.
+    /// @return The Q44.20 USD-per-whole-ETH price.
+    function ethUsdPriceQ20() external view returns (uint64) {
+        return _ethUsdQ20();
+    }
+
+    /// @dev The ETH/USD price for bond sizing: the feed when configured, else
+    ///      the pushed price. The feed's own `decimals()` sets the scale, so any
+    ///      correctly-configured aggregator works without assumptions here.
+    ///
+    ///      Deliberately does NOT reject a stale price. This value sizes a
+    ///      *refundable* bond, so an old price costs a taker cents on a deposit
+    ///      they get straight back, whereas reverting would stop every fill on
+    ///      every pair. Halting the venue to avoid mis-sizing a $5 refundable
+    ///      deposit is the wrong way round. {isEthPriceStale} reports staleness
+    ///      for monitoring instead of enforcing it.
+    ///
+    ///      The two remaining checks are arithmetic safety, not price policy: a
+    ///      negative answer would overflow the cast, and a zero result would
+    ///      divide by zero in {_usdToWei}.
+    /// @return The Q44.20 USD-per-whole-ETH price.
+    function _ethUsdQ20() internal view returns (uint64) {
+        AggregatorV3Interface feed = ethUsdFeed;
+        if (address(feed) == address(0)) {
+            if (ethOraclePrice == 0) revert EthOracleUnset();
+            return ethOraclePrice;
+        }
+
+        (, int256 answer, , , ) = feed.latestRoundData();
+        if (answer <= 0) revert BadOraclePrice();
+
+        uint256 q20 = (uint256(answer) * Q_DENOM) / (10 ** feed.decimals());
+        if (q20 == 0 || q20 > type(uint64).max) revert BadOraclePrice();
+        return uint64(q20);
     }
 
     /// @notice Update the governable bond / window parameters. Owner only.
@@ -669,7 +811,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     function setParams(
         uint64 fillBondUsd_,
         uint64 makerBondUsd_,
-        uint256 bountyBps_,
+        uint16 bountyBps_,
         uint64 windowSeconds_
     ) external onlyOwner {
         if (bountyBps_ > BPS_DENOM) revert WrongBond();
@@ -678,6 +820,20 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         bountyBps = bountyBps_;
         windowSeconds = windowSeconds_;
         emit ParamsUpdated(fillBondUsd_, makerBondUsd_, bountyBps_, windowSeconds_);
+    }
+
+    /// @notice Halt trading across every pair. Owner only.
+    /// @dev    Blocks createOrder, fillOrder and topUpOrder contract-wide;
+    ///         cancelOrder, activateOrder and publishBracket stay open so
+    ///         escrow and posted bonds stay recoverable. See {delistToken}.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume trading. Owner only.
+    /// @dev    Tokens delisted while paused stay delisted — levers are independent.
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /// @notice Return the whitelist config for a token.
@@ -711,9 +867,54 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param  usd6 The USD amount, scaled by 1e6.
     /// @return The equivalent wei (0 when `usd6` is 0).
     function _usdToWei(uint64 usd6) internal view returns (uint256) {
+        // Skipped entirely when the bond is 0, so a zero-bond configuration
+        // never needs a live price at all.
         if (usd6 == 0) return 0;
-        if (ethOraclePrice == 0) revert EthOracleUnset();
-        return (uint256(usd6) * 1e12 * Q_DENOM) / ethOraclePrice;
+        return (uint256(usd6) * 1e12 * Q_DENOM) / _ethUsdQ20();
+    }
+
+    /// @dev True when `updatedAt` is older than {maxPriceAge}. Always false when
+    ///      the window is 0 (checks disabled). Widened to uint256 so a large
+    ///      window cannot overflow the addition.
+    /// @param  updatedAt The timestamp to age-check.
+    /// @return Whether the value is considered stale.
+    function _isStale(uint256 updatedAt) internal view returns (bool) {
+        if (maxPriceAge == 0) return false;
+        return block.timestamp > updatedAt + uint256(maxPriceAge);
+    }
+
+    /// @notice Whether a whitelisted token's bracket price has gone stale.
+    /// @dev    Advisory only — {_toUSD} never reverts on this. Brackets are
+    ///         coarse buckets, so a slightly old price mis-sorts the book at
+    ///         worst;
+    ///         fUSD is never stale: it is the unit of account, pinned at $1.
+    /// @param  token The token to check.
+    /// @return True when the price is older than {maxPriceAge}.
+    function isPriceStale(address token) external view returns (bool) {
+        if (token == address(fUSD)) return false;
+        return _isStale(_tokenConfig[token].priceUpdatedAt);
+    }
+
+    /// @notice Seconds since a token's bracket price was last updated.
+    /// @param  token The token to check.
+    /// @return The age in seconds (0 if never set).
+    function priceAge(address token) external view returns (uint256) {
+        uint64 updatedAt = _tokenConfig[token].priceUpdatedAt;
+        return updatedAt == 0 ? 0 : block.timestamp - updatedAt;
+    }
+
+    /// @notice Whether the ETH/USD price used for bond sizing has gone stale.
+    /// @dev    Advisory, like {isPriceStale} — nothing reverts on it. Reads
+    ///         whichever source {_ethUsdQ20} would: the feed's own `updatedAt`
+    ///         when one is configured, otherwise {ethPriceUpdatedAt}. Reporting
+    ///         the pushed timestamp while a feed is in use would be wrong in
+    ///         both directions, so the branch matters.
+    /// @return True when that price is older than {maxPriceAge}.
+    function isEthPriceStale() external view returns (bool) {
+        AggregatorV3Interface feed = ethUsdFeed;
+        if (address(feed) == address(0)) return _isStale(ethPriceUpdatedAt);
+        (, , , uint256 updatedAt, ) = feed.latestRoundData();
+        return _isStale(updatedAt);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -744,11 +945,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint64 expiry,
         externalEuint64 encAmount,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint256 orderId) {
+    ) external payable nonReentrant whenNotPaused returns (uint256 orderId) {
         if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
         if (address(inputToken) == address(outputToken)) revert SameLeg();
-        if (!_tokenConfig[address(inputToken)].whitelisted) revert TokenNotWhitelisted(address(inputToken));
-        if (!_tokenConfig[address(outputToken)].whitelisted) revert TokenNotWhitelisted(address(outputToken));
+        _requireWhitelisted(address(inputToken), address(outputToken));
         if (price == 0) revert ZeroPrice();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
@@ -800,7 +1000,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
-            settled: false
+            settled: false,
+            bountyBps: 0
         });
 
         _makerOrderIds[msg.sender].push(orderId);
@@ -852,11 +1053,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encDelta,
         bytes calldata inputProof
-    ) external nonReentrant returns (uint64 seq) {
+    ) external nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (o.closed) revert OrderClosed();
         if (msg.sender != o.maker) revert NotMaker();
+        _requireWhitelisted(address(o.inputToken), address(o.outputToken));
 
         euint64 delta = FHE.asEuint64(encDelta, inputProof);
 
@@ -887,7 +1089,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
-            settled: false
+            settled: false,
+            bountyBps: 0
         });
 
         emit OrderToppedUp(orderId, msg.sender, seq);
@@ -914,11 +1117,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         uint256 orderId,
         externalEuint64 encTokensWanted,
         bytes calldata inputProof
-    ) external payable nonReentrant returns (uint64 seq) {
+    ) external payable nonReentrant whenNotPaused returns (uint64 seq) {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
         if (!o.active) revert OrderNotActive();
         if (o.expiry != 0 && block.timestamp > o.expiry) revert OrderExpired();
+        _requireWhitelisted(address(o.inputToken), address(o.outputToken));
 
         // Fill bond.
         uint256 bond = ethBondSize();
@@ -934,7 +1138,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             depositor: msg.sender,
             bondWei: bond,
             deadline: uint64(block.timestamp) + windowSeconds,
-            settled: false
+            settled: false,
+            bountyBps: bountyBps
         });
 
         // Record the interaction for the taker's activity feed (set dedupes).
@@ -954,13 +1159,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @param inputProof      Batch signature covering `encTokensWanted`.
     function _swap(Order storage o, externalEuint64 encTokensWanted, bytes calldata inputProof) internal {
         // Cap requested amount at available remaining and the overflow bound.
-        // FHE.mul below is mod 2^64; cap so eActual × price never wraps.
+        // FHE.mul/add are mod 2^64 and the ceil below adds Q_DENOM-1 to the
+        // product, so the bound reserves room for that term as well.
         euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted, inputProof), o.eRemaining);
-        eActual = FHE.min(eActual, FHE.asEuint64(type(uint64).max / o.price));
+        eActual = FHE.min(eActual, FHE.asEuint64((type(uint64).max - (Q_DENOM - 1)) / o.price));
         FHE.allowThis(eActual);
 
-        // Output cost via Q44.20 price: eActual × price >> 20.
-        euint64 eOutput = FHE.shr(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_SHR_20);
+        // Rounded UP, so the sub-unit residue is charged to the taker rather
+        // than gifted to them — it is the maker's, and up to one raw unit/fill.
+        euint64 eOutput = FHE.shr(FHE.add(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_Q_MASK), _E_SHR_20);
         FHE.allowThis(eOutput);
 
         // Pull output from taker directly to maker (no intermediate escrow).
@@ -981,11 +1188,16 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         FHE.allowThis(eRelease);
 
         // Send released input from OTC escrow to taker.
-        FHE.allow(eRelease, msg.sender); // taker can verify receipt
-        o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken)));
+        euint64 eDelivered = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        FHE.allowThis(eDelivered);
+        FHE.allow(eDelivered, msg.sender); // taker can verify receipt
 
-        // Decrement remaining.
-        o.eRemaining = FHE.sub(o.eRemaining, eRelease);
+        // Decrement remaining. Any shortfall stays in eRemaining, so it remains
+        // the maker's and is recoverable by cancelOrder.
+        o.eRemaining = FHE.sub(o.eRemaining, eDelivered);
         FHE.allowThis(o.eRemaining);
         FHE.allow(o.eRemaining, o.maker); // maker can track their position
     }
@@ -1057,8 +1269,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             }
 
             // Frontier rule: only a publish for the latest record changes listing.
+            // An expired order delists exactly like a depleted one — same
+            // predicate as fillOrder, so listing and fillability cannot diverge.
             if (seq == o.latestSeq) {
-                if (value != BRACKET_EMPTY) {
+                bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+                if (value != BRACKET_EMPTY && !expired) {
                     if (!o.active) {
                         bool wasPending = o.pending;
                         o.active = true;
@@ -1089,7 +1304,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             } else {
                 // After window, live frontier → bounty to publisher, remainder
                 // to depositor.
-                uint256 bounty = (p.bondWei * bountyBps) / BPS_DENOM;
+                uint256 bounty = (p.bondWei * p.bountyBps) / BPS_DENOM;
                 if (bounty > 0) _payEth(msg.sender, bounty);
                 _payEth(p.depositor, p.bondWei - bounty);
             }
@@ -1104,17 +1319,21 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
 
     /// @notice Cancel an order and return the remaining escrow AND the maker
     ///         bond to the maker. Works in the pending, active, and dormant
-    ///         states. Maker only; terminal.
+    ///         states. Maker only until expiry, then anyone; terminal.
     ///
-    /// @dev    Outstanding fill Publish records survive: their depositors can
-    ///         still publish to settle and recover their bonds. The canonical
-    ///         bracket is moot once closed.
+    /// @dev    Escrow and bond always go to `o.maker`, so a third-party cancel
+    ///         of an expired order moves no value to the caller — it only frees
+    ///         a pair-index slot nothing else can. Expiry 0 stays maker-only.
+    ///         Outstanding fill Publish records survive: their depositors can
+    ///         still publish to settle and recover their bonds.
     /// @param  orderId The order to cancel.
     function cancelOrder(uint256 orderId) external nonReentrant {
         Order storage o = orders[orderId];
         if (o.maker == address(0)) revert OrderNotFound();
-        if (msg.sender != o.maker) revert NotMaker();
         if (o.closed) revert OrderClosed();
+
+        bool expired = o.expiry != 0 && block.timestamp > o.expiry;
+        if (msg.sender != o.maker && !expired) revert NotExpired();
 
         bool wasActive = o.active;
         o.active = false;
@@ -1126,8 +1345,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
             _pairOrders[_pairKey(address(o.inputToken), address(o.outputToken))].remove(orderId);
         }
 
-        // Return escrowed input.
-        o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken)));
+        // Return escrowed input, decrementing by what the token reports
+        // returning.
+        euint64 eReturned = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        o.eRemaining = FHE.sub(o.eRemaining, eReturned);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker);
 
         // Return the maker bond, if any.
         uint256 bond = o.makerBondWei;
@@ -1137,6 +1363,29 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         }
 
         emit OrderCancelled(orderId);
+    }
+
+    /// @notice Retry returning escrow that a clamped transfer left behind on a
+    ///         closed order. Maker only.
+    ///
+    /// @dev    `cancelOrder` is terminal and cannot condition on the transfer's
+    ///         encrypted result, so a delivery that clamped to 0 would otherwise
+    ///         strand the escrow forever. Idempotent: with nothing left this
+    ///         moves 0 and changes no state.
+    /// @param  orderId The closed order to sweep.
+    function claimEscrow(uint256 orderId) external nonReentrant {
+        Order storage o = orders[orderId];
+        if (o.maker == address(0)) revert OrderNotFound();
+        if (!o.closed) revert OrderNotClosed();
+        if (msg.sender != o.maker) revert NotMaker();
+
+        euint64 eReturned = FHE.receiveEuint64FromCall(
+            o.inputToken.confidentialTransfer(o.maker, FHE.shareEuint64(o.eRemaining, address(o.inputToken))),
+            address(o.inputToken)
+        );
+        o.eRemaining = FHE.sub(o.eRemaining, eReturned);
+        FHE.allowThis(o.eRemaining);
+        FHE.allow(o.eRemaining, o.maker);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1193,17 +1442,31 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @return bondWei   The bond held, in wei (0 for maker records).
     /// @return deadline  The depositor-exclusive window end (0 for maker records).
     /// @return settled   Whether the bond has been settled.
+    /// @return bountyBps_ The bounty rate stamped at fill time, in bps.
     function getPublish(
         uint256 orderId,
         uint64 seq
-    ) external view returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled) {
+    )
+        external
+        view
+        returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled, uint16 bountyBps_)
+    {
         Publish storage p = _publishes[orderId][seq];
-        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled);
+        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled, p.bountyBps);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Reverts unless both legs are currently whitelisted. Enforced on
+    ///      every path that opens or increases exposure — create, fill, top-up.
+    /// @param inputToken  The order's escrowed leg.
+    /// @param outputToken The order's requested leg.
+    function _requireWhitelisted(address inputToken, address outputToken) internal view {
+        if (!_tokenConfig[inputToken].whitelisted) revert TokenNotWhitelisted(inputToken);
+        if (!_tokenConfig[outputToken].whitelisted) revert TokenNotWhitelisted(outputToken);
+    }
 
     /// @dev Builds the {OrderView} projection, sourcing the frontier bracket
     ///      handle from the latest publish record.
@@ -1247,24 +1510,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
         if (!ok) revert EthTransferFailed();
     }
 
-    /// @dev Converts an encrypted input amount to its USD-equivalent for
-    ///      bracket computation. Three cases, in priority order:
-    ///
-    ///   1. inputToken == fUSD  → identity (already in USD).
-    ///   2. outputToken == fUSD → use the maker's order price (Q44.20).
-    ///   3. cANY<>cANY          → use the inputToken oracle price (Q44.20).
-    ///
-    ///      An overflow cap (same pattern as fillOrder) ensures eAmount × price
-    ///      never wraps uint64. For large whale orders the cap still resolves to
-    ///      WHALE — brackets are indicators, not exact values.
+    /// @dev Converts an encrypted input amount to its USD-equivalent for bracket
+    ///      computation, always at the input leg's oracle price — never at the
+    ///      maker-supplied `o.price`, which is unbounded and, since the cap below
+    ///      is inversely tied to the rate, let a maker publish a one-unit order
+    ///      as WHALE. The cap keeps eAmount × price inside uint64.
     /// @param  eAmount The encrypted input-token amount to value.
-    /// @param  o       The order whose legs/price select the conversion path.
+    /// @param  o       The order whose input leg selects the oracle price.
     /// @return The encrypted USD-equivalent (6-decimal fUSD units).
     function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
-        if (address(o.inputToken) == address(fUSD)) return eAmount;
-
-        uint64 convPrice =
-            (address(o.outputToken) == address(fUSD)) ? o.price : _tokenConfig[address(o.inputToken)].oraclePrice;
+        uint64 convPrice = _tokenConfig[address(o.inputToken)].oraclePrice;
+        if (convPrice == Q_DENOM) return eAmount;
 
         uint64 maxSafe = type(uint64).max / convPrice;
         euint64 eSafe = FHE.min(eAmount, FHE.asEuint64(maxSafe));

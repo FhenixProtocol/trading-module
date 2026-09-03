@@ -464,25 +464,25 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).setOracle(bob.address)).wait();
 
       const newPrice = 70_000n * Q; // $70k
-      await (await otc.connect(bob).updateOraclePrice(ecbtcAddr, newPrice)).wait();
+      await (await otc.connect(bob).updateOraclePrices([ecbtcAddr], [newPrice])).wait();
       expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(newPrice);
     });
 
     it("owner can also update oracle price directly", async () => {
       const { deployer, otc, ecbtcAddr } = await setup();
-      await (await otc.connect(deployer).updateOraclePrice(ecbtcAddr, 70_000n * Q)).wait();
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [70_000n * Q])).wait();
       expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(70_000n * Q);
     });
 
-    it("updateOraclePrice reverts for unauthorized callers", async () => {
+    it("updateOraclePrices reverts for unauthorized callers", async () => {
       const { alice, otc, ecbtcAddr } = await setup();
-      await expect(otc.connect(alice).updateOraclePrice(ecbtcAddr, Q)).to.be.revertedWithCustomError(
+      await expect(otc.connect(alice).updateOraclePrices([ecbtcAddr], [Q])).to.be.revertedWithCustomError(
         otc,
         "Unauthorized",
       );
     });
 
-    it("updateOraclePrice reverts for non-whitelisted token", async () => {
+    it("updateOraclePrices reverts for non-whitelisted token", async () => {
       const { deployer, otc } = await setup();
       const unlisted = (await ethers.deployContract("FHERC20_Harness", [
         "U",
@@ -492,16 +492,73 @@ describe("ConfidentialOTC", () => {
       ])) as unknown as ConfidentialToken;
       await unlisted.waitForDeployment();
       await expect(
-        otc.connect(deployer).updateOraclePrice(await unlisted.getAddress(), Q),
+        otc.connect(deployer).updateOraclePrices([await unlisted.getAddress()], [Q]),
       ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
     });
 
-    it("updateOraclePrice reverts when price is below MIN_ORACLE_PRICE", async () => {
+    it("updateOraclePrices reverts when price is below MIN_ORACLE_PRICE", async () => {
       const { deployer, otc, ecbtcAddr } = await setup();
-      await expect(otc.connect(deployer).updateOraclePrice(ecbtcAddr, 0n)).to.be.revertedWithCustomError(
+      await expect(otc.connect(deployer).updateOraclePrices([ecbtcAddr], [0n])).to.be.revertedWithCustomError(
         otc,
         "ZeroPrice",
       );
+    });
+
+    // ── updateOraclePrices (batch) ──────────────────────────────────────────
+
+    it("updateOraclePrices reprices several tokens in one tx and emits per token", async () => {
+      const { deployer, bob, otc, ecbtcAddr, ecethAddr } = await setup();
+      await (await otc.connect(deployer).setOracle(bob.address)).wait();
+
+      const btc = 70_000n * Q;
+      const eth = 4_000n * Q;
+      await expect(otc.connect(bob).updateOraclePrices([ecbtcAddr, ecethAddr], [btc, eth]))
+        .to.emit(otc, "OraclePriceUpdated")
+        .withArgs(ecbtcAddr, btc)
+        .and.to.emit(otc, "OraclePriceUpdated")
+        .withArgs(ecethAddr, eth);
+
+      const [cfgBtc, cfgEth] = await Promise.all([otc.getTokenConfig(ecbtcAddr), otc.getTokenConfig(ecethAddr)]);
+      expect(cfgBtc.oraclePrice).to.equal(btc);
+      expect(cfgEth.oraclePrice).to.equal(eth);
+      expect(cfgBtc.priceUpdatedAt).to.equal(cfgEth.priceUpdatedAt); // same block
+    });
+
+    it("updateOraclePrices reverts on length mismatch", async () => {
+      const { deployer, otc, ecbtcAddr, ecethAddr } = await setup();
+      await expect(otc.connect(deployer).updateOraclePrices([ecbtcAddr, ecethAddr], [Q])).to.be.revertedWithCustomError(
+        otc,
+        "LengthMismatch",
+      );
+    });
+
+    it("updateOraclePrices is atomic: one bad entry reverts the whole batch", async () => {
+      const { deployer, otc, ecbtcAddr, ecethAddr } = await setup();
+      const before = (await otc.getTokenConfig(ecbtcAddr)).oraclePrice;
+      const unlisted = (await ethers.deployContract("FHERC20_Harness", [
+        "U",
+        "U",
+        6,
+        "",
+      ])) as unknown as ConfidentialToken;
+      await unlisted.waitForDeployment();
+
+      // Valid first entry, unlisted second: nothing may persist from entry 0.
+      await expect(
+        otc.connect(deployer).updateOraclePrices([ecbtcAddr, await unlisted.getAddress()], [70_000n * Q, Q]),
+      ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
+      expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(before);
+
+      // Same for a below-minimum price anywhere in the batch.
+      await expect(
+        otc.connect(deployer).updateOraclePrices([ecbtcAddr, ecethAddr], [70_000n * Q, 0n]),
+      ).to.be.revertedWithCustomError(otc, "ZeroPrice");
+      expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(before);
+    });
+
+    it("updateOraclePrices accepts an empty batch as a no-op", async () => {
+      const { deployer, otc } = await setup();
+      await (await otc.connect(deployer).updateOraclePrices([], [])).wait();
     });
   });
 
@@ -1359,7 +1416,7 @@ describe("ConfidentialOTC", () => {
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
 
       // Crash: oracle drops from $65,000 to $1,000 per BTC.
-      await (await otc.connect(deployer).updateOraclePrice(ecbtcAddr, 1_000n * Q)).wait();
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [1_000n * Q])).wait();
 
       // Fill 500 raw; remaining 1_500 raw × $1,000 = $1.50 → NANO
       const value = await fillAndPublish(otc, bob, bobClient, id, 500n);

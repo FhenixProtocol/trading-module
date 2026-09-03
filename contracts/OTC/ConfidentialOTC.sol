@@ -285,7 +285,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     mapping(address => TokenConfig) private _tokenConfig;
 
-    /// @notice Address permitted to call `updateOraclePrice` / `setEthOraclePrice`.
+    /// @notice Address permitted to call `updateOraclePrices` / `setEthOraclePrice`.
     ///         Owner always has the same privilege. Zero address disables the role.
     address public oracle;
 
@@ -721,18 +721,27 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         emit OracleUpdated(previousOracle, oracle_);
     }
 
-    /// @notice Update the Q44.20 oracle price for a whitelisted token.
-    /// @dev    Callable by the designated oracle or the owner. The price is used
-    ///         only for bracket computation and does not affect open orders.
-    /// @param  token The whitelisted token to reprice.
-    /// @param  price The new Q44.20 price (≥ MIN_ORACLE_PRICE).
-    function updateOraclePrice(address token, uint64 price) external {
+    /// @notice Update the Q44.20 oracle prices for one or more whitelisted tokens
+    ///         in a single transaction.
+    /// @dev    Callable by the designated oracle or the owner. Prices are used
+    ///         only for bracket computation and do not affect open orders. The
+    ///         batch is atomic: an unlisted token or a sub-minimum price anywhere
+    ///         in it reverts the whole call, so a pusher never lands a partial
+    ///         price set. A single token is just a one-element batch.
+    /// @param  tokens The whitelisted tokens to reprice.
+    /// @param  prices The new Q44.20 prices (each ≥ MIN_ORACLE_PRICE), index-aligned with `tokens`.
+    function updateOraclePrices(address[] calldata tokens, uint64[] calldata prices) external {
         if (msg.sender != oracle && msg.sender != owner()) revert Unauthorized();
-        if (!_tokenConfig[token].whitelisted) revert TokenNotWhitelisted(token);
-        if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
-        _tokenConfig[token].oraclePrice = price;
-        _tokenConfig[token].priceUpdatedAt = uint64(block.timestamp);
-        emit OraclePriceUpdated(token, price);
+        if (tokens.length != prices.length) revert LengthMismatch();
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            address token = tokens[i];
+            uint64 price = prices[i];
+            if (!_tokenConfig[token].whitelisted) revert TokenNotWhitelisted(token);
+            if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
+            _tokenConfig[token].oraclePrice = price;
+            _tokenConfig[token].priceUpdatedAt = uint64(block.timestamp);
+            emit OraclePriceUpdated(token, price);
+        }
     }
 
     /// @notice Update the ETH/USD oracle price (Q44.20) used to size ETH bonds.

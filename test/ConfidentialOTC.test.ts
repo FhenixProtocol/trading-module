@@ -2354,7 +2354,7 @@ describe("ConfidentialOTC", () => {
       const carol = (await ethers.getSigners())[3];
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
 
       await expectBalance(ecbtc, carol.address, fee);
       await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
@@ -2363,35 +2363,35 @@ describe("ConfidentialOTC", () => {
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
-    it("throttles sweeps to once per COLLECT_COOLDOWN, defeating the sandwich", async () => {
+    it("throttles sweeps to once per SWEEP_COOLDOWN, defeating the sandwich", async () => {
       const { deployer, bob, ecbtc, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
 
-      const cooldown = await otc.COLLECT_COOLDOWN();
+      const cooldown = await otc.SWEEP_COOLDOWN();
       expect(cooldown).to.equal(82_800n); // 23h
 
       // First sweep is never blocked — no prior collection to wait on.
-      expect(await otc.lastCollectAt(ecbtcAddr)).to.equal(0n);
-      expect(await otc.collectUnlockAt(ecbtcAddr)).to.equal(0n);
+      expect(await otc.lastSweepAt(ecbtcAddr)).to.equal(0n);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(0n);
 
       await fillAndPublish(otc, bob, bobClient, id, 400n);
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
 
-      const last = await otc.lastCollectAt(ecbtcAddr);
+      const last = await otc.lastSweepAt(ecbtcAddr);
       expect(last).to.be.greaterThan(0n);
-      expect(await otc.collectUnlockAt(ecbtcAddr)).to.equal(last + cooldown);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(last + cooldown);
 
       // The sandwich: a second fill lands, and the owner tries to collect again
       // straight away to isolate that single fill's fee. Blocked.
       await fillAndPublish(otc, bob, bobClient, id, 200n);
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
 
-      const unlock = Number(await otc.collectUnlockAt(ecbtcAddr));
+      const unlock = Number(await otc.sweepUnlockAt(ecbtcAddr));
 
       await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock - 1]);
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "CollectTooSoon");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
 
       await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock]);
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesCollected");
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
     });
 
     it("allows the next sweep once the cooldown elapses, aggregating the interim fills", async () => {
@@ -2412,7 +2412,7 @@ describe("ConfidentialOTC", () => {
       await fillAndPublish(otc, bob, bobClient, id, 200n);
       await fillAndPublish(otc, bob, bobClient, id, 100n);
 
-      await hre.network.provider.send("evm_increaseTime", [Number(await otc.COLLECT_COOLDOWN())]);
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
       await hre.network.provider.send("evm_mine");
 
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();

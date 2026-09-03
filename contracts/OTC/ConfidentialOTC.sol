@@ -195,7 +195,7 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// the zero-fee fast path — you cannot branch on a ciphertext.
 ///
 /// Accrued fees are swept by the owner via `sweepFees(token)` to `treasury`,
-/// at most once per COLLECT_COOLDOWN (23h) per token. A sweep discloses its own
+/// at most once per SWEEP_COOLDOWN (23h) per token. A sweep discloses its own
 /// size to the treasury, so throttling it stops the owner from bracketing a
 /// single fill to back out that taker's exact amount from the public fee rate.
 ///
@@ -260,7 +260,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @dev Minimum interval between fee sweeps of the same token. Deliberately
     ///      a constant: it exists to constrain the owner, so an owner-settable
     ///      version would defeat itself. See {sweepFees}.
-    uint64 public constant COLLECT_COOLDOWN = 23 hours;
+    uint64 public constant SWEEP_COOLDOWN = 23 hours;
 
     /// @dev seq assigned to the create record. Fills and top-ups increment from
     ///      here, so the create record is always the first and is published by
@@ -413,9 +413,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      zero handle, which `FHE.add` treats as encrypted zero.
     mapping(address => euint64) private _feesAccrued;
 
-    /// @dev Last {sweepFees} timestamp per token, enforcing COLLECT_COOLDOWN.
+    /// @dev Last {sweepFees} timestamp per token, enforcing SWEEP_COOLDOWN.
     ///      0 means never swept, which never blocks the first sweep.
-    mapping(address => uint64) private _lastCollectAt;
+    mapping(address => uint64) private _lastSweepAt;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -650,7 +650,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param  to       The treasury address that received them.
     /// @param  eAmount  Encrypted amount actually transferred (readable by the
     ///                  treasury and this contract).
-    event FeesCollected(address indexed token, address indexed to, euint64 eAmount);
+    event FeesSwept(address indexed token, address indexed to, euint64 eAmount);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Errors
@@ -706,8 +706,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     error FeeTooHigh();
     /// @notice No fees have accrued for the token being swept.
     error NoFeesAccrued();
-    /// @notice A fee sweep was attempted before COLLECT_COOLDOWN elapsed.
-    error CollectTooSoon();
+    /// @notice A fee sweep was attempted before SWEEP_COOLDOWN elapsed.
+    error SweepTooSoon();
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -1006,51 +1006,51 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///         `token` is the sum of open orders' `eRemaining` plus accrued
     ///         fees, and each fee was carved out of input that had already been
     ///         debited from an order's `eRemaining`.
-    ///         Rate-limited to once per COLLECT_COOLDOWN per token. A sweep
+    ///         Rate-limited to once per SWEEP_COOLDOWN per token. A sweep
     ///         always discloses its own size — the treasury can decrypt its own
     ///         balance whatever ACL is set here — so an unthrottled sweep would
-    ///         let the owner bracket a single fill (collect, wait for one fill,
-    ///         collect) and read its fee. The rate is public, so that recovers
+    ///         let the owner bracket a single fill (sweep, wait for one fill,
+    ///         sweep) and read its fee. The rate is public, so that recovers
     ///         the taker's exact amount. The cooldown forces each disclosed
     ///         total to aggregate a day of fills. It is a hard constant, not a
     ///         governable one, since the owner is the party it constrains.
     /// @param  token      The token to sweep.
-    /// @return eCollected The encrypted amount actually transferred.
-    function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eCollected) {
+    /// @return eSwept The encrypted amount actually transferred.
+    function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eSwept) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
 
-        uint64 last = _lastCollectAt[token];
-        if (last != 0 && block.timestamp < last + COLLECT_COOLDOWN) revert CollectTooSoon();
+        uint64 last = _lastSweepAt[token];
+        if (last != 0 && block.timestamp < last + SWEEP_COOLDOWN) revert SweepTooSoon();
 
         _feesAccrued[token] = euint64.wrap(0);
-        _lastCollectAt[token] = uint64(block.timestamp);
+        _lastSweepAt[token] = uint64(block.timestamp);
 
         address to = treasury;
-        eCollected = FHE.receiveEuint64FromCall(
+        eSwept = FHE.receiveEuint64FromCall(
             IFHERC20(token).confidentialTransfer(to, FHE.shareEuint64(accrued, token)),
             token
         );
 
-        FHE.allowThis(eCollected);
-        FHE.allow(eCollected, to);
+        FHE.allowThis(eSwept);
+        FHE.allow(eSwept, to);
 
-        emit FeesCollected(token, to, eCollected);
+        emit FeesSwept(token, to, eSwept);
     }
 
     /// @notice Timestamp of the last fee sweep for a token (0 if never swept).
     /// @param  token The token to query.
     /// @return The last sweep timestamp.
-    function lastCollectAt(address token) external view returns (uint64) {
-        return _lastCollectAt[token];
+    function lastSweepAt(address token) external view returns (uint64) {
+        return _lastSweepAt[token];
     }
 
     /// @notice Earliest timestamp at which `token` may next be swept.
     /// @param  token The token to query.
     /// @return The unlock timestamp (0 when the token has never been swept).
-    function collectUnlockAt(address token) external view returns (uint64) {
-        uint64 last = _lastCollectAt[token];
-        return last == 0 ? 0 : last + COLLECT_COOLDOWN;
+    function sweepUnlockAt(address token) external view returns (uint64) {
+        uint64 last = _lastSweepAt[token];
+        return last == 0 ? 0 : last + SWEEP_COOLDOWN;
     }
 
     /// @notice Encrypted handle of the live swap fee.

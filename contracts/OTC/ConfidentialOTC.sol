@@ -101,6 +101,12 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// bracket computation — it does not affect fill math, which uses the
 /// maker-specified order price exclusively.
 ///
+/// Bracket notional is `raw input units × price >> 20`, in raw 6-decimal fUSD
+/// units. Because the oracle price is per WHOLE token, that product is only in
+/// fUSD units when the input token itself has 6 decimals; a coarser ledger
+/// needs ×10^(6 − decimals). `_toUSD` reads the token's confidential decimals
+/// and rescales the price on every bracket computation.
+///
 /// fUSD is auto-whitelisted in the constructor at oraclePrice = Q_DENOM ($1).
 /// Additional tokens are whitelisted by the owner via `whitelistToken`. Oracle
 /// prices (including the ETH price used for bonds) are updated by the
@@ -199,7 +205,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @dev Any whitelisted token's confidential ledger may use at most this
     ///      many decimals. Tokens with more than 6 decimals cannot be priced
-    ///      precisely in Q44.20. Enforced at whitelist time so createOrder never
+    ///      precisely in Q44.20; tokens with fewer are rescaled for bracket math
+    ///      (see {_toUSD}). Enforced at whitelist time so createOrder never
     ///      needs to re-check.
     uint8 public constant MAX_TOKEN_DECIMALS = 6;
 
@@ -1515,11 +1522,18 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      maker-supplied `o.price`, which is unbounded and, since the cap below
     ///      is inversely tied to the rate, let a maker publish a one-unit order
     ///      as WHALE. The cap keeps eAmount × price inside uint64.
+    ///
+    ///      The oracle price is per WHOLE token, so `raw × price >> 20` is only in
+    ///      6-decimal fUSD units when the input token has 6 decimals. A coarser
+    ///      confidential ledger is rescaled by 10^(FUSD_DECIMALS − decimals); the
+    ///      whitelist cap guarantees the exponent is never negative.
     /// @param  eAmount The encrypted input-token amount to value.
     /// @param  o       The order whose input leg selects the oracle price.
     /// @return The encrypted USD-equivalent (6-decimal fUSD units).
     function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
-        uint64 convPrice = _tokenConfig[address(o.inputToken)].oraclePrice;
+        address inputToken = address(o.inputToken);
+        uint64 convPrice = _tokenConfig[inputToken].oraclePrice *
+            uint64(10 ** (FUSD_DECIMALS - _confidentialDecimals(inputToken)));
         if (convPrice == Q_DENOM) return eAmount;
 
         uint64 maxSafe = type(uint64).max / convPrice;

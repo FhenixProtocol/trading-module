@@ -13,6 +13,43 @@ type HardhatEthersSigner = Awaited<ReturnType<typeof hre.ethers.getSigners>>[num
 /** Mintable FHERC20 stand-in (existing repo harness — replaces MockFUSD/MockOTCToken/MockDecimalsToken). */
 type ConfidentialToken = FHERC20_Harness;
 
+// Dual-ledger (public ERC-20 + confidential layer) tokens link the shared library.
+// Used to pin that the OTC checks `confidentialDecimals()` — the ledger it trades on —
+// rather than the public `decimals()`.
+const LIB_FQN = "contracts/ERC20Confidential/ERC20ConfidentialLib.sol:ERC20ConfidentialLib";
+
+async function linkedFactory(name: string) {
+  const lib = await ethers.deployContract(LIB_FQN);
+  await lib.waitForDeployment();
+  return ethers.getContractFactory(name, { libraries: { [LIB_FQN]: await lib.getAddress() } });
+}
+
+/** 6-decimal public ledger scaled to `confDecimals` confidential precision (mirrors FUSDJmi). */
+async function deployDualLedger(confDecimals: number) {
+  const Harness = await linkedFactory("ConfidentialHarness");
+  const token = await Harness.deploy();
+  await token.waitForDeployment();
+  await (await token.initialize(confDecimals)).wait();
+  return token;
+}
+
+/** FhenixToken: 18-decimal public ledger, `confDecimals` confidential precision (proxy deploy). */
+async function deployFhenixToken(confDecimals: number) {
+  const [deployer] = await ethers.getSigners();
+  const implFactory = await linkedFactory("FhenixTokenHarness");
+  const impl = await implFactory.deploy();
+  await impl.waitForDeployment();
+  const initData = impl.interface.encodeFunctionData("initialize", [
+    deployer.address,
+    deployer.address,
+    0,
+    confDecimals,
+  ]);
+  const proxy = await ethers.deployContract("ERC1967Proxy", [await impl.getAddress(), initData]);
+  await proxy.waitForDeployment();
+  return implFactory.attach(await proxy.getAddress());
+}
+
 const Q = 1_048_576n; // 2^20 — Q44.20 denominator
 const FAR_FUTURE = 281_474_976_710_655n; // uint48.max — operator approval window
 const ONE = 1_000_000n; // 1 whole token at 6 decimals
@@ -261,6 +298,31 @@ describe("ConfidentialOTC", () => {
       await expect(factory.deploy(await fusd18.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
     });
 
+    // Dual-ledger fUSD (FUSDJmi shape): the public ledger is always 6 decimals, but the
+    // confidential layer — the only ledger the OTC escrows and settles on — can be coarser.
+    // The bracket thresholds and the $1 auto-price are in 6-decimal confidential units, so a
+    // 4-decimal confidential fUSD would silently misprice every order by 100×. The public
+    // `decimals()` check alone cannot catch this because it always reads 6.
+    it("reverts when a dual-ledger fUSD's confidential layer is not 6 decimals (public is 6)", async () => {
+      const fusd = await deployDualLedger(4);
+      expect(await fusd.confidentialDecimals()).to.equal(4);
+
+      const factory = await ethers.getContractFactory("ConfidentialOTC");
+      await expect(factory.deploy(await fusd.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
+    });
+
+    it("accepts a dual-ledger fUSD whose confidential layer is 6 decimals", async () => {
+      const fusd = await deployDualLedger(6);
+      const otc = (await ethers.deployContract("ConfidentialOTC", [
+        await fusd.getAddress(),
+      ])) as unknown as ConfidentialOTC;
+      await otc.waitForDeployment();
+
+      const config = await otc.getTokenConfig(await fusd.getAddress());
+      expect(config.whitelisted).to.equal(true);
+      expect(config.oraclePrice).to.equal(Q);
+    });
+
     it("auto-whitelists fUSD at Q_DENOM", async () => {
       const { otc, fusdAddr } = await setup();
       const config = await otc.getTokenConfig(fusdAddr);
@@ -325,6 +387,38 @@ describe("ConfidentialOTC", () => {
       ])) as unknown as ConfidentialToken;
       await token8.waitForDeployment();
       await expect(otc.connect(deployer).whitelistToken(await token8.getAddress(), Q)).to.be.revertedWithCustomError(
+        otc,
+        "InvalidDecimals",
+      );
+    });
+
+    // Dual-ledger tokens: the check must target the confidential layer, not the public ERC-20.
+    it("whitelists a dual-ledger token with 18 public / 6 confidential decimals", async () => {
+      const { deployer, otc } = await setup();
+      const Mock = await linkedFactory("MockERC20Confidential");
+      const token = await Mock.deploy("Confidential Token", "CTK", 18); // public 18 → confidential clamped to 6
+      await token.waitForDeployment();
+      expect(await token.decimals()).to.equal(18);
+      expect(await token.confidentialDecimals()).to.equal(6);
+
+      const tokenAddr = await token.getAddress();
+      await (await otc.connect(deployer).whitelistToken(tokenAddr, 1_000n * Q)).wait();
+      expect((await otc.getTokenConfig(tokenAddr)).whitelisted).to.equal(true);
+    });
+
+    it("whitelists a dual-ledger token with 6 public / 4 confidential decimals", async () => {
+      const { deployer, otc } = await setup();
+      const token = await deployDualLedger(4);
+      const tokenAddr = await token.getAddress();
+      await (await otc.connect(deployer).whitelistToken(tokenAddr, 1_000n * Q)).wait();
+      expect((await otc.getTokenConfig(tokenAddr)).whitelisted).to.equal(true);
+    });
+
+    it("whitelistToken reverts for a dual-ledger token whose confidential layer exceeds 6 decimals", async () => {
+      const { deployer, otc } = await setup();
+      const token = await deployFhenixToken(8); // public 18 / confidential 8
+      expect(await token.confidentialDecimals()).to.equal(8);
+      await expect(otc.connect(deployer).whitelistToken(await token.getAddress(), Q)).to.be.revertedWithCustomError(
         otc,
         "InvalidDecimals",
       );

@@ -122,7 +122,10 @@ import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 ///                   batch signature bound to this contract.
 ///
 /// All tokens are capped at 6 decimals (enforced at whitelist time); fUSD
-/// must use exactly 6 decimals (enforced in the constructor).
+/// must use exactly 6 decimals (enforced in the constructor). The decimals
+/// that matter are those of the CONFIDENTIAL ledger — the only ledger this
+/// venue ever moves — so dual-ledger tokens (e.g. FUSDJmi, FhenixToken) are
+/// checked via `confidentialDecimals()` rather than the public `decimals()`.
 ///
 /// A maker may call `topUpOrder` to inject more input tokens (even into a
 /// dormant order, to revive it). Both `eRemaining` and `eDepositedAmount` grow
@@ -173,13 +176,14 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     /// @dev Q44.20 price denominator: 2^20 = 1_048_576.
     uint64 public constant Q_DENOM = 1_048_576;
 
-    /// @dev fUSD must use exactly this many decimals — the bracket thresholds
-    ///      below are denominated in 6-decimal fUSD units.
+    /// @dev fUSD's confidential ledger must use exactly this many decimals —
+    ///      the bracket thresholds below are denominated in 6-decimal fUSD units.
     uint8 public constant FUSD_DECIMALS = 6;
 
-    /// @dev Any whitelisted token may use at most this many decimals. Tokens
-    ///      with more than 6 decimals cannot be priced precisely in Q44.20.
-    ///      Enforced at whitelist time so createOrder never needs to re-check.
+    /// @dev Any whitelisted token's confidential ledger may use at most this
+    ///      many decimals. Tokens with more than 6 decimals cannot be priced
+    ///      precisely in Q44.20. Enforced at whitelist time so createOrder never
+    ///      needs to re-check.
     uint8 public constant MAX_TOKEN_DECIMALS = 6;
 
     /// @dev Minimum oracle price (Q44.20). Prevents tokens so cheap that
@@ -492,7 +496,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     error SameLeg();
     /// @notice A price or oracle price was zero / below MIN_ORACLE_PRICE.
     error ZeroPrice();
-    /// @notice A token's decimals are incompatible (fUSD != 6, or token > 6).
+    /// @notice A token's confidential-ledger decimals are incompatible (fUSD != 6, or token > 6).
     error InvalidDecimals();
     /// @notice The supplied expiry is already in the past.
     error InvalidExpiry();
@@ -531,15 +535,16 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Deploy the OTC, anchoring it to the fUSD unit of account.
-    /// @dev    Validates fUSD's decimals, auto-whitelists it at $1.00 (Q_DENOM),
-    ///         and precomputes the reusable encrypted bracket constants/thresholds
-    ///         (persisting their ACL so they remain valid operands in later txns).
-    ///         The deployer becomes the owner. `ethOraclePrice` starts unset and
-    ///         must be configured via {setEthOraclePrice} before any bonded action.
+    /// @dev    Validates fUSD's confidential-ledger decimals (see {_confidentialDecimals}),
+    ///         auto-whitelists it at $1.00 (Q_DENOM), and precomputes the reusable
+    ///         encrypted bracket constants/thresholds (persisting their ACL so they
+    ///         remain valid operands in later txns). The deployer becomes the owner.
+    ///         `ethOraclePrice` starts unset and must be configured via
+    ///         {setEthOraclePrice} before any bonded action.
     /// @param  fUSD_ The confidential stablecoin used as the bracket unit of account.
     constructor(IFHERC20 fUSD_) Ownable(msg.sender) {
         if (address(fUSD_) == address(0)) revert ZeroAddress();
-        if (fUSD_.decimals() != FUSD_DECIMALS) revert InvalidDecimals();
+        if (_confidentialDecimals(address(fUSD_)) != FUSD_DECIMALS) revert InvalidDecimals();
         fUSD = fUSD_;
 
         // Auto-whitelist fUSD at $1.00 in Q44.20 (= Q_DENOM).
@@ -586,19 +591,34 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Whitelist a token, enabling it as an input or output leg.
-    /// @dev    Enforces MAX_TOKEN_DECIMALS so createOrder never needs to re-check.
+    /// @dev    Enforces MAX_TOKEN_DECIMALS on the token's confidential ledger (see
+    ///         {_confidentialDecimals}) so createOrder never needs to re-check.
     /// @param  token        The token to whitelist.
     /// @param  initialPrice The token's initial Q44.20 oracle price (≥ MIN_ORACLE_PRICE).
     function whitelistToken(address token, uint64 initialPrice) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         if (initialPrice < MIN_ORACLE_PRICE) revert ZeroPrice();
-        if (IFHERC20(token).decimals() > MAX_TOKEN_DECIMALS) revert InvalidDecimals();
+        if (_confidentialDecimals(token) > MAX_TOKEN_DECIMALS) revert InvalidDecimals();
         _tokenConfig[token] = TokenConfig({
             whitelisted: true,
             oraclePrice: initialPrice,
             priceUpdatedAt: uint64(block.timestamp)
         });
         emit TokenWhitelisted(token, initialPrice);
+    }
+
+    /// @dev Decimals of the ledger this venue actually trades on. Every escrow, fill,
+    ///      release and refund goes through `confidentialTransfer*`, so for a dual-mode
+    ///      token (Erc20Confidential extension) the
+    ///      relevant precision is `confidentialDecimals()`, which can be coarser than the
+    ///      public `decimals()` backing it. Single-ledger FHERC20s expose only `decimals()`,
+    ///      which IS their confidential precision — used as the fallback.
+    function _confidentialDecimals(address token) internal view returns (uint8) {
+        (bool hasConfidentialDecimals, bytes memory result) = token.staticcall(
+            abi.encodeWithSignature('confidentialDecimals()')
+        );
+        if (hasConfidentialDecimals && result.length == 32) return abi.decode(result, (uint8));
+        return IFHERC20(token).decimals();
     }
 
     /// @notice Remove a token from the whitelist.

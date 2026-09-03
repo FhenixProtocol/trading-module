@@ -314,17 +314,23 @@ describe("ConfidentialOTC", () => {
     // 4-decimal confidential fUSD would silently misprice every order by 100×. The public
     // `decimals()` check alone cannot catch this because it always reads 6.
     it("reverts when a dual-ledger fUSD's confidential layer is not 6 decimals (public is 6)", async () => {
+      const [signer] = await ethers.getSigners();
       const fusd = await deployDualLedger(4);
       expect(await fusd.confidentialDecimals()).to.equal(4);
 
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
+      await expect(factory.deploy(await fusd.getAddress(), signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "InvalidDecimals",
+      );
     });
 
     it("accepts a dual-ledger fUSD whose confidential layer is 6 decimals", async () => {
+      const [signer] = await ethers.getSigners();
       const fusd = await deployDualLedger(6);
       const otc = (await ethers.deployContract("ConfidentialOTC", [
         await fusd.getAddress(),
+        signer.address,
       ])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
 
@@ -2112,9 +2118,10 @@ describe("ConfidentialOTC", () => {
     /// Mirrors the contract's Q44.20 skim: eRelease × feeQ20 >> 20.
     const feeOf = (amount: bigint, feeQ20: bigint) => (amount * feeQ20) >> 20n;
 
-    /// Mirrors _fillCap: the tighter of the price and fee overflow bounds.
+    /// Mirrors _fillCap: the tighter of the price and fee overflow bounds. The
+    /// price bound reserves Q−1 of headroom for the ceil-rounding add in _swap.
     const fillCap = (price: bigint, feeQ20: bigint) => {
-      let cap = MAXU64 / price;
+      let cap = (MAXU64 - (Q - 1n)) / price;
       if (feeQ20 > 1n) {
         const feeCap = MAXU64 / feeQ20;
         if (feeCap < cap) cap = feeCap;
@@ -2248,7 +2255,7 @@ describe("ConfidentialOTC", () => {
 
       const cap = fillCap(price, MAX_FEE);
       const deposit = cap + 10n ** 12n; // more than the cap, so it must clamp
-      const output = (cap * price) >> 20n;
+      const output = (cap * price + Q - 1n) >> 20n; // taker pays the ceiling
 
       await (await ecbtc.mint(alice.address, deposit)).wait();
       await (await ecbtc.connect(alice).setOperator(otcAddr, FAR_FUTURE)).wait();

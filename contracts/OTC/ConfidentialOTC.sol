@@ -46,9 +46,10 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 ///   active   → bracket published non-EMPTY; listed in the pair index; fillable
 ///              and top-up-able.
 ///   dormant  → was active, last published bracket is EMPTY (depleted) or the
-///              order expired; delisted but NOT destroyed — escrow is retained
-///              and the order can be revived by a top-up whose publish re-lists
-///              it (the symmetric frontier rule).
+///              order expired; delisted but NOT destroyed — escrow is retained.
+///              A depleted order can be revived by a top-up whose publish
+///              re-lists it (the symmetric frontier rule); an expired order
+///              rejects top-ups and can only be cancelled.
 ///   closed   → cancelled by the maker; terminal. Remaining escrow and the
 ///              maker bond are returned. Outstanding fill bonds remain
 ///              recoverable by their depositors.
@@ -151,7 +152,7 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// checked via `confidentialDecimals()` rather than the public `decimals()`.
 ///
 /// A maker may call `topUpOrder` to inject more input tokens (even into a
-/// dormant order, to revive it). Both `eRemaining` and `eDepositedAmount` grow
+/// depleted order, to revive it; not into an expired one). Both `eRemaining` and `eDepositedAmount` grow
 /// by the actual transferred delta; the new bracket is published by a follow-up
 /// `publishBracket`.
 ///
@@ -1052,7 +1053,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Inject additional input tokens into an order (active or dormant).
     ///
-    /// @dev    Maker only; the order must not be closed. Both `eRemaining` and
+    /// @dev    Maker only; the order must not be closed or expired. Both `eRemaining` and
     ///         `eDepositedAmount` increase by the amount actually transferred
     ///         (all-or-nothing). A new bracket snapshot is recorded under a fresh
     ///         seq; call `publishBracket(orderId, seq, ...)` to reveal it. If the
@@ -1074,6 +1075,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (o.maker == address(0)) revert OrderNotFound();
         if (o.closed) revert OrderClosed();
         if (msg.sender != o.maker) revert NotMaker();
+        if (o.expiry != 0 && block.timestamp > o.expiry) revert OrderExpired();
         _requireWhitelisted(address(o.inputToken), address(o.outputToken));
 
         euint64 delta = FHE.asEuint64(encDelta, inputProof);

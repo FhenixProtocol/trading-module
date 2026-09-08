@@ -1784,6 +1784,39 @@ describe("ConfidentialOTC", () => {
       expect(order.closed).to.equal(true);
     });
 
+    it("rejects top-ups after the expiry timestamp but allows them before", async () => {
+      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      // Before expiry: top-up escrows more.
+      await (await otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, mBTC, otc)))).wait();
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC);
+
+      // Jump past expiry.
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // An expired order cannot be grown — it is unfillable, so more escrow
+      // would only be dead weight the maker has to cancel to recover.
+      await expect(
+        otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, mBTC, otc))),
+      ).to.be.revertedWithCustomError(otc, "OrderExpired");
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC);
+    });
+
     it("delists on the next publish once expired, instead of staying listed", async () => {
       const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
 

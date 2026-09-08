@@ -1246,7 +1246,36 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         _publish(orderId, seq, decryptedBracket, signature);
     }
 
-    /// @dev Shared publish path for {activateOrder} and {publishBracket}: enforces
+    /// @notice Publish several records in one transaction. Entry `i` is
+    ///         processed exactly as `publishBracket(orderIds[i], seqs[i],
+    ///         decryptedBrackets[i], signatures[i])`, in array order; one
+    ///         failing entry reverts the whole batch.
+    ///
+    /// @dev    Every record still needs its own threshold decryption — the proof
+    ///         is verified per handle — so batching saves transactions, not
+    ///         decryptions. Entries are independent: the canonical bracket only
+    ///         advances on a higher seq and listing only changes on the frontier
+    ///         record, so the final state does not depend on entry order. A
+    ///         repeated entry reverts with {AlreadySettled}. Useful for a taker
+    ///         settling several fills, or a keeper sweeping post-window bounties.
+    /// @param  orderIds          The orders whose records are being published.
+    /// @param  seqs              The record seqs, one per order id.
+    /// @param  decryptedBrackets The threshold-decrypted bracket plaintexts.
+    /// @param  signatures        The threshold-network signatures over each decryption.
+    function publishBrackets(
+        uint256[] calldata orderIds,
+        uint64[] calldata seqs,
+        uint8[] calldata decryptedBrackets,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        uint256 n = orderIds.length;
+        if (seqs.length != n || decryptedBrackets.length != n || signatures.length != n) revert LengthMismatch();
+        for (uint256 i = 0; i < n; i++) {
+            _publish(orderIds[i], seqs[i], decryptedBrackets[i], signatures[i]);
+        }
+    }
+
+    /// @dev Shared publish path for {activateOrder}, {publishBracket} and {publishBrackets}: enforces
     ///      the fill-record window, verifies the decryption proof against the
     ///      record's immutable handle, advances the canonical bracket when the
     ///      record is ahead, applies the frontier listing/delisting rule, and

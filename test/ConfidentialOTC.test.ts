@@ -260,6 +260,24 @@ describe("ConfidentialOTC", () => {
     return BigInt(dec.decryptedValue);
   }
 
+  /// Decrypts each (id, seq) record's handle for `client` and returns the four
+  /// parallel arrays publishBrackets takes, plus the plaintext values.
+  async function publishInputs(otc: ConfidentialOTC, client: CofheClient, records: [bigint, bigint][]) {
+    const ids: bigint[] = [];
+    const seqs: bigint[] = [];
+    const values: bigint[] = [];
+    const sigs: string[] = [];
+    for (const [id, seq] of records) {
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(client, rec.handle);
+      ids.push(id);
+      seqs.push(seq);
+      values.push(BigInt(dec.decryptedValue));
+      sigs.push(dec.signature);
+    }
+    return { args: [ids, seqs, values, sigs] as const, values };
+  }
+
   /// fill + publish in one shot (taker publishes within the window).
   async function fillAndPublish(
     otc: ConfidentialOTC,
@@ -1283,6 +1301,123 @@ describe("ConfidentialOTC", () => {
       await expect(
         otc.connect(deployer).publishBracket(id, seq, dec.decryptedValue, dec.signature),
       ).to.changeEtherBalances([bob, deployer], [bond - bounty, bounty], { includeFee: false });
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // publishBrackets (batch)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("publishBrackets", () => {
+    /// Alice posts two 1 mBTC orders; Bob fills 400 raw of each, leaving two
+    /// unsettled fill records (one per order).
+    async function withTwoFills() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const ids: bigint[] = [];
+      const seqs: bigint[] = [];
+      for (let i = 0; i < 2; i++) {
+        const id = await createAndActivate(
+          otc,
+          alice,
+          aliceClient,
+          ecbtcAddr,
+          fusdAddr,
+          PRICE_BTC_FUSD,
+          0n,
+          ...(await enc(aliceClient, mBTC, otc)),
+        );
+        ids.push(id);
+        seqs.push(await fill(otc, bob, bobClient, id, 400n));
+      }
+      return { ...ctx, ids, seqs };
+    }
+
+    it("settles fill records on several orders in one tx, refunding every bond", async () => {
+      const { bob, otc, bobClient, otcAddr, ids, seqs } = await withTwoFills();
+      const bond = await otc.ethBondSize();
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(2n * bond);
+
+      const { args, values } = await publishInputs(otc, bobClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.changeEtherBalance(bob, 2n * bond, {
+        includeFee: false,
+      });
+
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      for (let i = 0; i < 2; i++) {
+        expect((await otc.getPublish(ids[i], seqs[i])).settled).to.equal(true);
+        const order = await otc.getOrder(ids[i]);
+        expect(order.publishedSeq).to.equal(seqs[i]);
+        expect(order.bracket).to.equal(values[i]);
+      }
+    });
+
+    it("is all-or-nothing: one already-settled entry reverts the whole batch", async () => {
+      const { bob, otc, bobClient, ids, seqs } = await withTwoFills();
+
+      // Settle the first record on its own, then include it again.
+      await publish(otc, bob, bobClient, ids[0], seqs[0]);
+      const { args } = await publishInputs(otc, bobClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.be.revertedWithCustomError(otc, "AlreadySettled");
+
+      // The other record is untouched by the failed batch.
+      expect((await otc.getPublish(ids[1], seqs[1])).settled).to.equal(false);
+    });
+
+    it("enforces the window per entry: a non-depositor batch reverts in-window", async () => {
+      const { deployer, otc, aliceClient, ids, seqs } = await withTwoFills();
+      const { args } = await publishInputs(otc, aliceClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(deployer).publishBrackets(...args)).to.be.revertedWithCustomError(otc, "NotInWindow");
+    });
+
+    it("rejects mismatched array lengths", async () => {
+      const { bob, otc, bobClient, ids, seqs } = await withTwoFills();
+      const { args } = await publishInputs(otc, bobClient, [[ids[0], seqs[0]]]);
+      const [oIds, oSeqs, oValues, oSigs] = args;
+      await expect(
+        otc.connect(bob).publishBrackets([...oIds, ids[1]], oSeqs, oValues, oSigs),
+      ).to.be.revertedWithCustomError(otc, "LengthMismatch");
+      await expect(otc.connect(bob).publishBrackets(oIds, oSeqs, oValues, [])).to.be.revertedWithCustomError(
+        otc,
+        "LengthMismatch",
+      );
+    });
+
+    it("handles several seqs of one order in any entry order; the frontier wins", async () => {
+      const { bob, otc, bobClient, otcAddr, ids, seqs } = await withTwoFills();
+      const bond = await otc.ethBondSize();
+
+      // Second fill on the first order creates a newer frontier record.
+      const seq2 = await fill(otc, bob, bobClient, ids[0], 400n);
+      expect(seq2).to.equal(seqs[0] + 1n);
+
+      // Publish the frontier first, then the older (now absorbed) record.
+      const { args, values } = await publishInputs(otc, bobClient, [
+        [ids[0], seq2],
+        [ids[0], seqs[0]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.changeEtherBalance(bob, 2n * bond, {
+        includeFee: false,
+      });
+
+      const order = await otc.getOrder(ids[0]);
+      expect(order.publishedSeq).to.equal(seq2);
+      expect(order.bracket).to.equal(values[0]);
+      expect((await otc.getPublish(ids[0], seqs[0])).settled).to.equal(true);
+      expect((await otc.getPublish(ids[0], seq2)).settled).to.equal(true);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond); // second order's bond still held
     });
   });
 

@@ -368,6 +368,35 @@ describe("ConfidentialOTC", () => {
       expect(cfg.oraclePrice).to.equal(1_000n * Q);
     });
 
+    /// Asserts a token's five raw-unit bracket thresholds: t = ceil(MAX × 2^20 / (P × 10^(6−dec))).
+    async function expectThresholds(otc: ConfidentialOTC, token: string, expected: bigint[]) {
+      const cfg = await otc.getTokenConfig(token);
+      const handles = [cfg.tEmpty, cfg.tNano, cfg.tSmall, cfg.tMedium, cfg.tLarge];
+      for (let i = 0; i < 5; i++) await hre.cofhe.mocks.expectPlaintext(handles[i], expected[i]);
+    }
+
+    it("derives raw-unit bracket thresholds on whitelist and re-derives them on every price push", async () => {
+      const { deployer, otc, fusdAddr, ecbtcAddr } = await setup();
+
+      // fUSD at $1 with 6 decimals: raw units ARE fUSD units, so the bounds are the USD maxima.
+      await expectThresholds(otc, fusdAddr, [1n, 100_000_000n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n]);
+
+      // ecBTC at $65,000: each bound is ceil(MAX / 65_000) raw units.
+      await expectThresholds(otc, ecbtcAddr, [1n, 1_539n, 15_385n, 153_847n, 1_538_462n]);
+
+      // A push at $100,000 divides evenly: $100 → 1_000 raw, $100k → 1_000_000 raw.
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [100_000n * Q])).wait();
+      await expectThresholds(otc, ecbtcAddr, [1n, 1_000n, 10_000n, 100_000n, 1_000_000n]);
+
+      // A 4-decimal ledger at $1,000/whole: $100 is 0.1 token = 1_000 raw, so the
+      // decimals rescale is folded into the thresholds too.
+      const token4 = await deployDualLedger(4);
+      const token4Addr = await token4.getAddress();
+      await (await otc.connect(deployer).whitelistToken(token4Addr, 1_000n * Q)).wait();
+      expect((await otc.getTokenConfig(token4Addr)).decimals).to.equal(4);
+      await expectThresholds(otc, token4Addr, [1n, 1_000n, 10_000n, 100_000n, 1_000_000n]);
+    });
+
     it("non-owner cannot whitelist", async () => {
       const { alice, otc } = await setup();
       const token = (await ethers.deployContract("FHERC20_Harness", ["T", "T", 6, ""])) as unknown as ConfidentialToken;

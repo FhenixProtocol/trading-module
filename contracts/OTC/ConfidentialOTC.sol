@@ -105,8 +105,10 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// Bracket notional is `raw input units × price >> 20`, in raw 6-decimal fUSD
 /// units. Because the oracle price is per WHOLE token, that product is only in
 /// fUSD units when the input token itself has 6 decimals; a coarser ledger
-/// needs ×10^(6 − decimals). `_toUSD` reads the token's confidential decimals
-/// and rescales the price on every bracket computation.
+/// needs ×10^(6 − decimals). Rather than doing that multiplication under FHE on
+/// every action, each USD bracket boundary is translated once into the token's
+/// own raw units (see `_storeTokenConfig`) whenever its price is pushed, and the
+/// encrypted amount is compared against those directly.
 ///
 /// fUSD is auto-whitelisted in the constructor at oraclePrice = Q_DENOM ($1).
 /// Additional tokens are whitelisted by the owner via `whitelistToken`. Oracle
@@ -207,7 +209,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @dev Any whitelisted token's confidential ledger may use at most this
     ///      many decimals. Tokens with more than 6 decimals cannot be priced
     ///      precisely in Q44.20; tokens with fewer are rescaled for bracket math
-    ///      (see {_toUSD}). Enforced at whitelist time so createOrder never
+    ///      (see {_storeTokenConfig}). Enforced at whitelist time so createOrder never
     ///      needs to re-check.
     uint8 public constant MAX_TOKEN_DECIMALS = 6;
 
@@ -251,12 +253,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     euint8 private immutable _E_BRACKET_LARGE;
     euint8 private immutable _E_BRACKET_WHALE;
 
-    /// @dev Encrypted bracket thresholds in raw fUSD units (6 decimals).
-    ///      Precomputed in constructor to avoid repeated FHE.asEuint64 calls.
-    euint64 private immutable _NANO_MAX; // 100_000_000   ($100)
-    euint64 private immutable _SMALL_MAX; // 1_000_000_000  ($1 000)
-    euint64 private immutable _MEDIUM_MAX; // 10_000_000_000  ($10 000)
-    euint64 private immutable _LARGE_MAX; // 100_000_000_000  ($100 000)
+    /// @dev Bracket upper bounds in raw fUSD units (6 decimals). Translated into
+    ///      each token's own raw units by {_storeTokenConfig}; never compared
+    ///      against directly.
+    uint64 internal constant NANO_MAX_USD = 100_000_000; // $100
+    uint64 internal constant SMALL_MAX_USD = 1_000_000_000; // $1 000
+    uint64 internal constant MEDIUM_MAX_USD = 10_000_000_000; // $10 000
+    uint64 internal constant LARGE_MAX_USD = 100_000_000_000; // $100 000
 
     /// @dev Precomputed shift operand for the Q44.20 right-shift (÷ 2^20).
     euint64 private immutable _E_SHR_20;
@@ -275,6 +278,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Per-token whitelist entry.
     /// @dev    oraclePrice is Q44.20 (floor(usd_per_whole_token × 2^20)) and is
     ///         used only for bracket computation — it does not affect fill math.
+    ///         The five `t*` handles are the bracket boundaries expressed in this
+    ///         token's raw units, re-derived from oraclePrice on every push so
+    ///         {_computeBracket} can compare an encrypted amount against them
+    ///         without any FHE arithmetic.
     struct TokenConfig {
         /// @dev Whether the token may be used as an order leg.
         bool whitelisted;
@@ -282,6 +289,18 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         uint64 oraclePrice;
         /// @dev Timestamp of the last oraclePrice update.
         uint64 priceUpdatedAt;
+        /// @dev Confidential-ledger decimals, captured at whitelist time.
+        uint8 decimals;
+        /// @dev Raw amounts below this are worth < 1 raw fUSD unit → EMPTY.
+        euint64 tEmpty;
+        /// @dev Raw amounts below this are worth < $100 → NANO.
+        euint64 tNano;
+        /// @dev Raw amounts below this are worth < $1 000 → SMALL.
+        euint64 tSmall;
+        /// @dev Raw amounts below this are worth < $10 000 → MEDIUM.
+        euint64 tMedium;
+        /// @dev Raw amounts below this are worth < $100 000 → LARGE; else WHALE.
+        euint64 tLarge;
     }
 
     mapping(address => TokenConfig) private _tokenConfig;
@@ -630,11 +649,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         // Auto-whitelist fUSD at $1.00 in Q44.20 (= Q_DENOM).
         // fUSD is the bracket unit of account, so its oracle price is always 1.
-        _tokenConfig[address(fUSD_)] = TokenConfig({
-            whitelisted: true,
-            oraclePrice: Q_DENOM,
-            priceUpdatedAt: uint64(block.timestamp)
-        });
+        _storeTokenConfig(address(fUSD_), Q_DENOM, FUSD_DECIMALS);
 
         _E_BRACKET_EMPTY = FHE.asEuint8(BRACKET_EMPTY);
         _E_BRACKET_NANO = FHE.asEuint8(BRACKET_NANO);
@@ -642,11 +657,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         _E_BRACKET_MEDIUM = FHE.asEuint8(BRACKET_MEDIUM);
         _E_BRACKET_LARGE = FHE.asEuint8(BRACKET_LARGE);
         _E_BRACKET_WHALE = FHE.asEuint8(BRACKET_WHALE);
-
-        _NANO_MAX = FHE.asEuint64(100_000_000);
-        _SMALL_MAX = FHE.asEuint64(1_000_000_000);
-        _MEDIUM_MAX = FHE.asEuint64(10_000_000_000);
-        _LARGE_MAX = FHE.asEuint64(100_000_000_000);
 
         _E_SHR_20 = FHE.asEuint64(20);
         _E_ZERO64 = FHE.asEuint64(0);
@@ -660,10 +670,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(_E_BRACKET_MEDIUM);
         FHE.allowThis(_E_BRACKET_LARGE);
         FHE.allowThis(_E_BRACKET_WHALE);
-        FHE.allowThis(_NANO_MAX);
-        FHE.allowThis(_SMALL_MAX);
-        FHE.allowThis(_MEDIUM_MAX);
-        FHE.allowThis(_LARGE_MAX);
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
         FHE.allowThis(_E_Q_MASK);
@@ -681,13 +687,52 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     function whitelistToken(address token, uint64 initialPrice) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         if (initialPrice < MIN_ORACLE_PRICE) revert ZeroPrice();
-        if (_confidentialDecimals(token) > MAX_TOKEN_DECIMALS) revert InvalidDecimals();
+        uint8 decimals = _confidentialDecimals(token);
+        if (decimals > MAX_TOKEN_DECIMALS) revert InvalidDecimals();
+        _storeTokenConfig(token, initialPrice, decimals);
+        emit TokenWhitelisted(token, initialPrice);
+    }
+
+    /// @dev Writes a token's whitelist record, deriving its five encrypted
+    ///      bracket thresholds from `price` and `decimals`. The single write
+    ///      path for the constructor, {whitelistToken} and {updateOraclePrices},
+    ///      so the bracket path pays no conversion cost.
+    ///
+    ///      The bracket test is `floor(r × P / 2^20) < MAX`, where `r` is the
+    ///      raw amount and `P` the Q44.20 price rescaled to the token's decimals.
+    ///      For integer `r` and `MAX` that is exactly `r < ceil(MAX × 2^20 / P)`,
+    ///      so each USD bound maps to one raw-unit bound and the encrypted side
+    ///      needs only a comparison. The EMPTY test (`usd == 0`) is the same
+    ///      identity with MAX = 1. The largest bound is `1e11 × 2^20 / P ≤ ~1e17`
+    ///      at the minimum price, so every threshold fits uint64 and no
+    ///      overflow cap is needed.
+    /// @param token    The token to (re)configure.
+    /// @param price    Its Q44.20 oracle price.
+    /// @param decimals Its confidential-ledger decimals (≤ MAX_TOKEN_DECIMALS).
+    function _storeTokenConfig(address token, uint64 price, uint8 decimals) internal {
+        uint256 convPrice = uint256(price) * 10 ** (FUSD_DECIMALS - decimals);
         _tokenConfig[token] = TokenConfig({
             whitelisted: true,
-            oraclePrice: initialPrice,
-            priceUpdatedAt: uint64(block.timestamp)
+            oraclePrice: price,
+            priceUpdatedAt: uint64(block.timestamp),
+            decimals: decimals,
+            tEmpty: _threshold(1, convPrice),
+            tNano: _threshold(NANO_MAX_USD, convPrice),
+            tSmall: _threshold(SMALL_MAX_USD, convPrice),
+            tMedium: _threshold(MEDIUM_MAX_USD, convPrice),
+            tLarge: _threshold(LARGE_MAX_USD, convPrice)
         });
-        emit TokenWhitelisted(token, initialPrice);
+    }
+
+    /// @dev `ceil(usdMax × 2^20 / convPrice)`, trivially encrypted and ACL'd for
+    ///      reuse as a comparison operand in later transactions.
+    /// @param usdMax    A bracket upper bound in raw fUSD units.
+    /// @param convPrice The token's Q44.20 price rescaled to its decimals.
+    /// @return The bound in the token's raw units, as a persistent euint64.
+    function _threshold(uint256 usdMax, uint256 convPrice) internal returns (euint64) {
+        euint64 t = FHE.asEuint64(uint64((usdMax * Q_DENOM + convPrice - 1) / convPrice));
+        FHE.allowThis(t);
+        return t;
     }
 
     /// @dev Decimals of the ledger this venue actually trades on. Every escrow, fill,
@@ -739,8 +784,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             uint64 price = prices[i];
             if (!_tokenConfig[token].whitelisted) revert TokenNotWhitelisted(token);
             if (price < MIN_ORACLE_PRICE) revert ZeroPrice();
-            _tokenConfig[token].oraclePrice = price;
-            _tokenConfig[token].priceUpdatedAt = uint64(block.timestamp);
+            _storeTokenConfig(token, price, _tokenConfig[token].decimals);
             emit OraclePriceUpdated(token, price);
         }
     }
@@ -901,7 +945,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @notice Whether a whitelisted token's bracket price has gone stale.
-    /// @dev    Advisory only — {_toUSD} never reverts on this. Brackets are
+    /// @dev    Advisory only — {_computeBracket} never reverts on this. Brackets are
     ///         coarse buckets, so a slightly old price mis-sorts the book at
     ///         worst;
     ///         fUSD is never stale: it is the unit of account, pinned at $1.
@@ -1007,11 +1051,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         o.closed = false;
 
         // ── Bracket snapshot (create record) ───────────────────────────────────
-        // Convert the escrowed input to USD-equivalent and compute the size
-        // bracket via FHE comparisons — the maker cannot misrepresent their size.
-        // Order is stored first so _toUSD can inspect both legs. The plaintext is
-        // revealed later by activateOrder. Maker record: bondless, no window.
-        euint8 b = _computeBracket(_toUSD(actual, o));
+        // Compute the size bracket from the escrowed input via FHE comparisons
+        // against the input token's raw-unit thresholds — the maker cannot
+        // misrepresent their size. The plaintext is revealed later by
+        // activateOrder. Maker record: bondless, no window.
+        euint8 b = _computeBracket(actual, address(o.inputToken));
         _publishes[orderId][CREATE_SEQ] = Publish({
             handle: b,
             depositor: msg.sender,
@@ -1101,7 +1145,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         // Snapshot the new bracket under a fresh seq (maker record: bondless).
         seq = ++o.latestSeq;
-        euint8 b = _computeBracket(_toUSD(o.eRemaining, o));
+        euint8 b = _computeBracket(o.eRemaining, address(o.inputToken));
         _publishes[orderId][seq] = Publish({
             handle: b,
             depositor: msg.sender,
@@ -1152,7 +1196,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         // ── Snapshot the post-fill bracket under a fresh seq (fill record) ─────
         seq = ++o.latestSeq;
         _publishes[orderId][seq] = Publish({
-            handle: _computeBracket(_toUSD(o.eRemaining, o)),
+            handle: _computeBracket(o.eRemaining, address(o.inputToken)),
             depositor: msg.sender,
             bondWei: bond,
             deadline: uint64(block.timestamp) + windowSeconds,
@@ -1557,56 +1601,33 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (!ok) revert EthTransferFailed();
     }
 
-    /// @dev Converts an encrypted input amount to its USD-equivalent for bracket
-    ///      computation, always at the input leg's oracle price — never at the
-    ///      maker-supplied `o.price`, which is unbounded and, since the cap below
-    ///      is inversely tied to the rate, let a maker publish a one-unit order
-    ///      as WHALE. The cap keeps eAmount × price inside uint64.
-    ///
-    ///      The oracle price is per WHOLE token, so `raw × price >> 20` is only in
-    ///      6-decimal fUSD units when the input token has 6 decimals. A coarser
-    ///      confidential ledger is rescaled by 10^(FUSD_DECIMALS − decimals); the
-    ///      whitelist cap guarantees the exponent is never negative.
-    /// @param  eAmount The encrypted input-token amount to value.
-    /// @param  o       The order whose input leg selects the oracle price.
-    /// @return The encrypted USD-equivalent (6-decimal fUSD units).
-    function _toUSD(euint64 eAmount, Order storage o) internal returns (euint64) {
-        address inputToken = address(o.inputToken);
-        uint64 convPrice = _tokenConfig[inputToken].oraclePrice *
-            uint64(10 ** (FUSD_DECIMALS - _confidentialDecimals(inputToken)));
-        if (convPrice == Q_DENOM) return eAmount;
-
-        uint64 maxSafe = type(uint64).max / convPrice;
-        euint64 eSafe = FHE.min(eAmount, FHE.asEuint64(maxSafe));
-        FHE.allowThis(eSafe);
-        euint64 eRaw = FHE.mul(eSafe, FHE.asEuint64(convPrice));
-        FHE.allowThis(eRaw);
-        euint64 eUSD = FHE.shr(eRaw, _E_SHR_20);
-        FHE.allowThis(eUSD);
-        return eUSD;
-    }
-
-    /// @dev Computes the size bracket from an encrypted fUSD amount using FHE
-    ///      comparisons and grants the necessary ACL permissions on the result.
+    /// @dev Computes the size bracket of an encrypted raw token amount using FHE
+    ///      comparisons against the token's stored raw-unit thresholds (see
+    ///      {_storeTokenConfig}), and grants the necessary ACL permissions on the
+    ///      result. Always keyed by the input leg's oracle price — never by the
+    ///      maker-supplied `o.price`, which is unbounded and would let a maker
+    ///      publish a one-unit order as WHALE.
     ///      Built with nested FHE.select calls from largest threshold to
     ///      smallest: start at WHALE and peel back each time the amount is
-    ///      below the next threshold, finally collapsing exact-zero to EMPTY.
+    ///      below the next threshold, finally collapsing sub-unit dust to EMPTY.
     ///      The result is allowPublic'd so the threshold network can decrypt it
     ///      for a later publishBracket proof.
-    /// @param  usdAmount The encrypted USD-equivalent size (6-decimal fUSD units).
+    /// @param  eAmount The encrypted amount in `token`'s raw units.
+    /// @param  token   The whitelisted token whose thresholds apply.
     /// @return The encrypted bracket label (0–5), allowThis'd and allowPublic'd.
-    function _computeBracket(euint64 usdAmount) internal returns (euint8) {
-        ebool isZero = FHE.eq(usdAmount, _E_ZERO64);
-        ebool ltNano = FHE.lt(usdAmount, _NANO_MAX);
-        ebool ltSmall = FHE.lt(usdAmount, _SMALL_MAX);
-        ebool ltMedium = FHE.lt(usdAmount, _MEDIUM_MAX);
-        ebool ltLarge = FHE.lt(usdAmount, _LARGE_MAX);
+    function _computeBracket(euint64 eAmount, address token) internal returns (euint8) {
+        TokenConfig storage c = _tokenConfig[token];
+        ebool isEmpty = FHE.lt(eAmount, c.tEmpty);
+        ebool ltNano = FHE.lt(eAmount, c.tNano);
+        ebool ltSmall = FHE.lt(eAmount, c.tSmall);
+        ebool ltMedium = FHE.lt(eAmount, c.tMedium);
+        ebool ltLarge = FHE.lt(eAmount, c.tLarge);
 
         euint8 b = FHE.select(ltLarge, _E_BRACKET_LARGE, _E_BRACKET_WHALE);
         b = FHE.select(ltMedium, _E_BRACKET_MEDIUM, b);
         b = FHE.select(ltSmall, _E_BRACKET_SMALL, b);
         b = FHE.select(ltNano, _E_BRACKET_NANO, b);
-        b = FHE.select(isZero, _E_BRACKET_EMPTY, b);
+        b = FHE.select(isEmpty, _E_BRACKET_EMPTY, b);
         FHE.allowThis(b);
         FHE.allowPublic(b);
         return b;

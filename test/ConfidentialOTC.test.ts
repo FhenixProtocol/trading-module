@@ -260,6 +260,24 @@ describe("ConfidentialOTC", () => {
     return BigInt(dec.decryptedValue);
   }
 
+  /// Decrypts each (id, seq) record's handle for `client` and returns the four
+  /// parallel arrays publishBrackets takes, plus the plaintext values.
+  async function publishInputs(otc: ConfidentialOTC, client: CofheClient, records: [bigint, bigint][]) {
+    const ids: bigint[] = [];
+    const seqs: bigint[] = [];
+    const values: bigint[] = [];
+    const sigs: string[] = [];
+    for (const [id, seq] of records) {
+      const rec = await otc.getPublish(id, seq);
+      const dec = await proof(client, rec.handle);
+      ids.push(id);
+      seqs.push(seq);
+      values.push(BigInt(dec.decryptedValue));
+      sigs.push(dec.signature);
+    }
+    return { args: [ids, seqs, values, sigs] as const, values };
+  }
+
   /// fill + publish in one shot (taker publishes within the window).
   async function fillAndPublish(
     otc: ConfidentialOTC,
@@ -348,6 +366,35 @@ describe("ConfidentialOTC", () => {
       const cfg = await otc.getTokenConfig(tokenAddr);
       expect(cfg.whitelisted).to.equal(true);
       expect(cfg.oraclePrice).to.equal(1_000n * Q);
+    });
+
+    /// Asserts a token's five raw-unit bracket thresholds: t = ceil(MAX × 2^20 / (P × 10^(6−dec))).
+    async function expectThresholds(otc: ConfidentialOTC, token: string, expected: bigint[]) {
+      const cfg = await otc.getTokenConfig(token);
+      const handles = [cfg.tEmpty, cfg.tNano, cfg.tSmall, cfg.tMedium, cfg.tLarge];
+      for (let i = 0; i < 5; i++) await hre.cofhe.mocks.expectPlaintext(handles[i], expected[i]);
+    }
+
+    it("derives raw-unit bracket thresholds on whitelist and re-derives them on every price push", async () => {
+      const { deployer, otc, fusdAddr, ecbtcAddr } = await setup();
+
+      // fUSD at $1 with 6 decimals: raw units ARE fUSD units, so the bounds are the USD maxima.
+      await expectThresholds(otc, fusdAddr, [1n, 100_000_000n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n]);
+
+      // ecBTC at $65,000: each bound is ceil(MAX / 65_000) raw units.
+      await expectThresholds(otc, ecbtcAddr, [1n, 1_539n, 15_385n, 153_847n, 1_538_462n]);
+
+      // A push at $100,000 divides evenly: $100 → 1_000 raw, $100k → 1_000_000 raw.
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [100_000n * Q])).wait();
+      await expectThresholds(otc, ecbtcAddr, [1n, 1_000n, 10_000n, 100_000n, 1_000_000n]);
+
+      // A 4-decimal ledger at $1,000/whole: $100 is 0.1 token = 1_000 raw, so the
+      // decimals rescale is folded into the thresholds too.
+      const token4 = await deployDualLedger(4);
+      const token4Addr = await token4.getAddress();
+      await (await otc.connect(deployer).whitelistToken(token4Addr, 1_000n * Q)).wait();
+      expect((await otc.getTokenConfig(token4Addr)).decimals).to.equal(4);
+      await expectThresholds(otc, token4Addr, [1n, 1_000n, 10_000n, 100_000n, 1_000_000n]);
     });
 
     it("non-owner cannot whitelist", async () => {
@@ -464,25 +511,25 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).setOracle(bob.address)).wait();
 
       const newPrice = 70_000n * Q; // $70k
-      await (await otc.connect(bob).updateOraclePrice(ecbtcAddr, newPrice)).wait();
+      await (await otc.connect(bob).updateOraclePrices([ecbtcAddr], [newPrice])).wait();
       expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(newPrice);
     });
 
     it("owner can also update oracle price directly", async () => {
       const { deployer, otc, ecbtcAddr } = await setup();
-      await (await otc.connect(deployer).updateOraclePrice(ecbtcAddr, 70_000n * Q)).wait();
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [70_000n * Q])).wait();
       expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(70_000n * Q);
     });
 
-    it("updateOraclePrice reverts for unauthorized callers", async () => {
+    it("updateOraclePrices reverts for unauthorized callers", async () => {
       const { alice, otc, ecbtcAddr } = await setup();
-      await expect(otc.connect(alice).updateOraclePrice(ecbtcAddr, Q)).to.be.revertedWithCustomError(
+      await expect(otc.connect(alice).updateOraclePrices([ecbtcAddr], [Q])).to.be.revertedWithCustomError(
         otc,
         "Unauthorized",
       );
     });
 
-    it("updateOraclePrice reverts for non-whitelisted token", async () => {
+    it("updateOraclePrices reverts for non-whitelisted token", async () => {
       const { deployer, otc } = await setup();
       const unlisted = (await ethers.deployContract("FHERC20_Harness", [
         "U",
@@ -492,16 +539,73 @@ describe("ConfidentialOTC", () => {
       ])) as unknown as ConfidentialToken;
       await unlisted.waitForDeployment();
       await expect(
-        otc.connect(deployer).updateOraclePrice(await unlisted.getAddress(), Q),
+        otc.connect(deployer).updateOraclePrices([await unlisted.getAddress()], [Q]),
       ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
     });
 
-    it("updateOraclePrice reverts when price is below MIN_ORACLE_PRICE", async () => {
+    it("updateOraclePrices reverts when price is below MIN_ORACLE_PRICE", async () => {
       const { deployer, otc, ecbtcAddr } = await setup();
-      await expect(otc.connect(deployer).updateOraclePrice(ecbtcAddr, 0n)).to.be.revertedWithCustomError(
+      await expect(otc.connect(deployer).updateOraclePrices([ecbtcAddr], [0n])).to.be.revertedWithCustomError(
         otc,
         "ZeroPrice",
       );
+    });
+
+    // ── updateOraclePrices (batch) ──────────────────────────────────────────
+
+    it("updateOraclePrices reprices several tokens in one tx and emits per token", async () => {
+      const { deployer, bob, otc, ecbtcAddr, ecethAddr } = await setup();
+      await (await otc.connect(deployer).setOracle(bob.address)).wait();
+
+      const btc = 70_000n * Q;
+      const eth = 4_000n * Q;
+      await expect(otc.connect(bob).updateOraclePrices([ecbtcAddr, ecethAddr], [btc, eth]))
+        .to.emit(otc, "OraclePriceUpdated")
+        .withArgs(ecbtcAddr, btc)
+        .and.to.emit(otc, "OraclePriceUpdated")
+        .withArgs(ecethAddr, eth);
+
+      const [cfgBtc, cfgEth] = await Promise.all([otc.getTokenConfig(ecbtcAddr), otc.getTokenConfig(ecethAddr)]);
+      expect(cfgBtc.oraclePrice).to.equal(btc);
+      expect(cfgEth.oraclePrice).to.equal(eth);
+      expect(cfgBtc.priceUpdatedAt).to.equal(cfgEth.priceUpdatedAt); // same block
+    });
+
+    it("updateOraclePrices reverts on length mismatch", async () => {
+      const { deployer, otc, ecbtcAddr, ecethAddr } = await setup();
+      await expect(otc.connect(deployer).updateOraclePrices([ecbtcAddr, ecethAddr], [Q])).to.be.revertedWithCustomError(
+        otc,
+        "LengthMismatch",
+      );
+    });
+
+    it("updateOraclePrices is atomic: one bad entry reverts the whole batch", async () => {
+      const { deployer, otc, ecbtcAddr, ecethAddr } = await setup();
+      const before = (await otc.getTokenConfig(ecbtcAddr)).oraclePrice;
+      const unlisted = (await ethers.deployContract("FHERC20_Harness", [
+        "U",
+        "U",
+        6,
+        "",
+      ])) as unknown as ConfidentialToken;
+      await unlisted.waitForDeployment();
+
+      // Valid first entry, unlisted second: nothing may persist from entry 0.
+      await expect(
+        otc.connect(deployer).updateOraclePrices([ecbtcAddr, await unlisted.getAddress()], [70_000n * Q, Q]),
+      ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
+      expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(before);
+
+      // Same for a below-minimum price anywhere in the batch.
+      await expect(
+        otc.connect(deployer).updateOraclePrices([ecbtcAddr, ecethAddr], [70_000n * Q, 0n]),
+      ).to.be.revertedWithCustomError(otc, "ZeroPrice");
+      expect((await otc.getTokenConfig(ecbtcAddr)).oraclePrice).to.equal(before);
+    });
+
+    it("updateOraclePrices accepts an empty batch as a no-op", async () => {
+      const { deployer, otc } = await setup();
+      await (await otc.connect(deployer).updateOraclePrices([], [])).wait();
     });
   });
 
@@ -1230,6 +1334,123 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // publishBrackets (batch)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("publishBrackets", () => {
+    /// Alice posts two 1 mBTC orders; Bob fills 400 raw of each, leaving two
+    /// unsettled fill records (one per order).
+    async function withTwoFills() {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const ids: bigint[] = [];
+      const seqs: bigint[] = [];
+      for (let i = 0; i < 2; i++) {
+        const id = await createAndActivate(
+          otc,
+          alice,
+          aliceClient,
+          ecbtcAddr,
+          fusdAddr,
+          PRICE_BTC_FUSD,
+          0n,
+          ...(await enc(aliceClient, mBTC, otc)),
+        );
+        ids.push(id);
+        seqs.push(await fill(otc, bob, bobClient, id, 400n));
+      }
+      return { ...ctx, ids, seqs };
+    }
+
+    it("settles fill records on several orders in one tx, refunding every bond", async () => {
+      const { bob, otc, bobClient, otcAddr, ids, seqs } = await withTwoFills();
+      const bond = await otc.ethBondSize();
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(2n * bond);
+
+      const { args, values } = await publishInputs(otc, bobClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.changeEtherBalance(bob, 2n * bond, {
+        includeFee: false,
+      });
+
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(0n);
+      for (let i = 0; i < 2; i++) {
+        expect((await otc.getPublish(ids[i], seqs[i])).settled).to.equal(true);
+        const order = await otc.getOrder(ids[i]);
+        expect(order.publishedSeq).to.equal(seqs[i]);
+        expect(order.bracket).to.equal(values[i]);
+      }
+    });
+
+    it("is all-or-nothing: one already-settled entry reverts the whole batch", async () => {
+      const { bob, otc, bobClient, ids, seqs } = await withTwoFills();
+
+      // Settle the first record on its own, then include it again.
+      await publish(otc, bob, bobClient, ids[0], seqs[0]);
+      const { args } = await publishInputs(otc, bobClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.be.revertedWithCustomError(otc, "AlreadySettled");
+
+      // The other record is untouched by the failed batch.
+      expect((await otc.getPublish(ids[1], seqs[1])).settled).to.equal(false);
+    });
+
+    it("enforces the window per entry: a non-depositor batch reverts in-window", async () => {
+      const { deployer, otc, aliceClient, ids, seqs } = await withTwoFills();
+      const { args } = await publishInputs(otc, aliceClient, [
+        [ids[0], seqs[0]],
+        [ids[1], seqs[1]],
+      ]);
+      await expect(otc.connect(deployer).publishBrackets(...args)).to.be.revertedWithCustomError(otc, "NotInWindow");
+    });
+
+    it("rejects mismatched array lengths", async () => {
+      const { bob, otc, bobClient, ids, seqs } = await withTwoFills();
+      const { args } = await publishInputs(otc, bobClient, [[ids[0], seqs[0]]]);
+      const [oIds, oSeqs, oValues, oSigs] = args;
+      await expect(
+        otc.connect(bob).publishBrackets([...oIds, ids[1]], oSeqs, oValues, oSigs),
+      ).to.be.revertedWithCustomError(otc, "LengthMismatch");
+      await expect(otc.connect(bob).publishBrackets(oIds, oSeqs, oValues, [])).to.be.revertedWithCustomError(
+        otc,
+        "LengthMismatch",
+      );
+    });
+
+    it("handles several seqs of one order in any entry order; the frontier wins", async () => {
+      const { bob, otc, bobClient, otcAddr, ids, seqs } = await withTwoFills();
+      const bond = await otc.ethBondSize();
+
+      // Second fill on the first order creates a newer frontier record.
+      const seq2 = await fill(otc, bob, bobClient, ids[0], 400n);
+      expect(seq2).to.equal(seqs[0] + 1n);
+
+      // Publish the frontier first, then the older (now absorbed) record.
+      const { args, values } = await publishInputs(otc, bobClient, [
+        [ids[0], seq2],
+        [ids[0], seqs[0]],
+      ]);
+      await expect(otc.connect(bob).publishBrackets(...args)).to.changeEtherBalance(bob, 2n * bond, {
+        includeFee: false,
+      });
+
+      const order = await otc.getOrder(ids[0]);
+      expect(order.publishedSeq).to.equal(seq2);
+      expect(order.bracket).to.equal(values[0]);
+      expect((await otc.getPublish(ids[0], seqs[0])).settled).to.equal(true);
+      expect((await otc.getPublish(ids[0], seq2)).settled).to.equal(true);
+      expect(await ethers.provider.getBalance(otcAddr)).to.equal(bond); // second order's bond still held
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // cANY<>cANY
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -1359,7 +1580,7 @@ describe("ConfidentialOTC", () => {
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
 
       // Crash: oracle drops from $65,000 to $1,000 per BTC.
-      await (await otc.connect(deployer).updateOraclePrice(ecbtcAddr, 1_000n * Q)).wait();
+      await (await otc.connect(deployer).updateOraclePrices([ecbtcAddr], [1_000n * Q])).wait();
 
       // Fill 500 raw; remaining 1_500 raw × $1,000 = $1.50 → NANO
       const value = await fillAndPublish(otc, bob, bobClient, id, 500n);
@@ -1725,6 +1946,39 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(false);
       expect(order.closed).to.equal(true);
+    });
+
+    it("rejects top-ups after the expiry timestamp but allows them before", async () => {
+      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        now + 1_000n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      // Before expiry: top-up escrows more.
+      await (await otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, mBTC, otc)))).wait();
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC);
+
+      // Jump past expiry.
+      await hre.network.provider.send("evm_increaseTime", [2_000]);
+      await hre.network.provider.send("evm_mine");
+
+      // An expired order cannot be grown — it is unfillable, so more escrow
+      // would only be dead weight the maker has to cancel to recover.
+      await expect(
+        otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, mBTC, otc))),
+      ).to.be.revertedWithCustomError(otc, "OrderExpired");
+      await expectBalance(ecbtc, otcAddr, 2n * mBTC);
     });
 
     it("delists on the next publish once expired, instead of staying listed", async () => {

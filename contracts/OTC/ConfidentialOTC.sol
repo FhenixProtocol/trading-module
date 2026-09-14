@@ -402,12 +402,30 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         bool closed;
     }
 
+    /// @notice Which action produced a {Publish} record. Lets a per-order history
+    ///         feed be read straight off the existing record chain (seq 1..latestSeq)
+    ///         without any additional indexing.
+    enum PublishKind {
+        Create,
+        Fill,
+        TopUp
+    }
+
     /// @notice Per-action bracket snapshot. Created in tx1 (create/fill/top-up)
     ///         and consumed by `publishBracket`.
     struct Publish {
         /// @dev Encrypted bracket of eRemaining *after* this action. Immutable,
         ///      so the proof is valid whenever it lands.
         euint8 handle;
+        /// @dev Which action produced this record.
+        PublishKind kind;
+        /// @dev Encrypted size of this action: input tokens deposited (Create/TopUp)
+        ///      or actually released to the taker (Fill — zero on an underpaid fill,
+        ///      same as `eDelivered`).
+        euint64 amount;
+        /// @dev Encrypted output-token amount the taker actually paid. Zero for
+        ///      Create/TopUp; on Fill equal to `eOutputPaid` (zero on an underpaid fill).
+        euint64 paid;
         /// @dev Who posted the record (taker for fills; maker for create/top-up).
         address depositor;
         /// @dev Bond in wei. >0 only for fill records; 0 for maker records.
@@ -673,6 +691,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
         FHE.allowThis(_E_Q_MASK);
+
+        FHE.allowPublic(_E_ZERO64);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1058,6 +1078,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         euint8 b = _computeBracket(actual, address(o.inputToken));
         _publishes[orderId][CREATE_SEQ] = Publish({
             handle: b,
+            kind: PublishKind.Create,
+            amount: actual,
+            paid: _E_ZERO64,
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
@@ -1132,6 +1155,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             address(o.inputToken)
         );
         FHE.allowThis(actual);
+        FHE.allow(actual, o.maker);
 
         // Grow remaining balance.
         o.eRemaining = FHE.add(o.eRemaining, actual);
@@ -1148,6 +1172,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         euint8 b = _computeBracket(o.eRemaining, address(o.inputToken));
         _publishes[orderId][seq] = Publish({
             handle: b,
+            kind: PublishKind.TopUp,
+            amount: actual,
+            paid: _E_ZERO64,
             depositor: msg.sender,
             bondWei: 0,
             deadline: 0,
@@ -1191,12 +1218,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (msg.value < bond) revert WrongBond();
 
         // ── Settle the swap atomically (isolated frame to bound stack depth) ───
-        _swap(o, encTokensWanted, inputProof);
+        (euint64 eDelivered, euint64 eOutputPaid) = _swap(o, encTokensWanted, inputProof);
 
         // ── Snapshot the post-fill bracket under a fresh seq (fill record) ─────
         seq = ++o.latestSeq;
         _publishes[orderId][seq] = Publish({
             handle: _computeBracket(o.eRemaining, address(o.inputToken)),
+            kind: PublishKind.Fill,
+            amount: eDelivered,
+            paid: eOutputPaid,
             depositor: msg.sender,
             bondWei: bond,
             deadline: uint64(block.timestamp) + windowSeconds,
@@ -1219,7 +1249,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param o               The order being filled (mutated in place).
     /// @param encTokensWanted The taker's encrypted requested input amount.
     /// @param inputProof      Batch signature covering `encTokensWanted`.
-    function _swap(Order storage o, externalEuint64 encTokensWanted, bytes calldata inputProof) internal {
+    /// @return eDelivered     Input tokens actually released to the taker (zero on
+    ///                        an underpaid fill) — stored as the fill record's `amount`.
+    /// @return eOutputPaid    Output tokens actually paid by the taker (zero on an
+    ///                        underpaid fill) — stored as the fill record's `paid`.
+    function _swap(
+        Order storage o,
+        externalEuint64 encTokensWanted,
+        bytes calldata inputProof
+    ) internal returns (euint64 eDelivered, euint64 eOutputPaid) {
         // Cap requested amount at available remaining and the overflow bound.
         // FHE.mul/add are mod 2^64 and the ceil below adds Q_DENOM-1 to the
         // product, so the bound reserves room for that term as well.
@@ -1233,13 +1271,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(eOutput);
 
         // Pull output from taker directly to maker (no intermediate escrow).
-        euint64 eOutputPaid = FHE.receiveEuint64FromCall(
+        eOutputPaid = FHE.receiveEuint64FromCall(
             o.outputToken.confidentialTransferFrom(
                 msg.sender, o.maker, FHE.shareEuint64(eOutput, address(o.outputToken))
             ),
             address(o.outputToken)
         );
         FHE.allowThis(eOutputPaid);
+        FHE.allow(eOutputPaid, msg.sender);
+        FHE.allow(eOutputPaid, o.maker);
 
         // Release input only if the taker paid in full (and not dust).
         euint64 eRelease = FHE.select(
@@ -1250,12 +1290,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(eRelease);
 
         // Send released input from OTC escrow to taker.
-        euint64 eDelivered = FHE.receiveEuint64FromCall(
+        eDelivered = FHE.receiveEuint64FromCall(
             o.inputToken.confidentialTransfer(msg.sender, FHE.shareEuint64(eRelease, address(o.inputToken))),
             address(o.inputToken)
         );
         FHE.allowThis(eDelivered);
         FHE.allow(eDelivered, msg.sender); // taker can verify receipt
+        FHE.allow(eDelivered, o.maker);
 
         // Decrement remaining. Any shortfall stays in eRemaining, so it remains
         // the maker's and is recoverable by cancelOrder.
@@ -1529,6 +1570,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param  orderId   The order the record belongs to.
     /// @param  seq       The record's seq.
     /// @return handle    The encrypted bracket snapshot handle.
+    /// @return kind      Which action produced this record (Create/Fill/TopUp).
+    /// @return amount    Encrypted size of this action (deposited, or released to
+    ///                   the taker on Fill); decryptable by the maker (and, on
+    ///                   Fill, the taker).
+    /// @return paid      Encrypted output-token amount the taker paid; zero
+    ///                   (publicly so) for Create/TopUp, decryptable by the maker
+    ///                   and taker on Fill.
     /// @return depositor The address that posted the record.
     /// @return bondWei   The bond held, in wei (0 for maker records).
     /// @return deadline  The depositor-exclusive window end (0 for maker records).
@@ -1540,10 +1588,30 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     )
         external
         view
-        returns (bytes32 handle, address depositor, uint256 bondWei, uint64 deadline, bool settled, uint16 bountyBps_)
+        returns (
+            bytes32 handle,
+            PublishKind kind,
+            bytes32 amount,
+            bytes32 paid,
+            address depositor,
+            uint256 bondWei,
+            uint64 deadline,
+            bool settled,
+            uint16 bountyBps_
+        )
     {
         Publish storage p = _publishes[orderId][seq];
-        return (euint8.unwrap(p.handle), p.depositor, p.bondWei, p.deadline, p.settled, p.bountyBps);
+        return (
+            euint8.unwrap(p.handle),
+            p.kind,
+            euint64.unwrap(p.amount),
+            euint64.unwrap(p.paid),
+            p.depositor,
+            p.bondWei,
+            p.deadline,
+            p.settled,
+            p.bountyBps
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

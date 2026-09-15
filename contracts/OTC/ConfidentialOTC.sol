@@ -484,11 +484,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         /// @dev Highest seq whose bracket is canonical.
         uint64 publishedSeq;
         /// @dev Frontier encrypted bracket handle (for optional manual decrypt).
-        bytes32 bracketHandle;
+        euint8 bracketHandle;
         /// @dev Encrypted remaining balance handle (maker-decryptable).
-        bytes32 remainingHandle;
+        euint64 remainingHandle;
         /// @dev Encrypted cumulative deposited handle (maker-decryptable).
-        bytes32 depositedHandle;
+        euint64 depositedHandle;
         /// @dev True while listed and fillable.
         bool active;
         /// @dev True before the first successful publish.
@@ -1589,10 +1589,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         external
         view
         returns (
-            bytes32 handle,
+            euint8 handle,
             PublishKind kind,
-            bytes32 amount,
-            bytes32 paid,
+            euint64 amount,
+            euint64 paid,
             address depositor,
             uint256 bondWei,
             uint64 deadline,
@@ -1601,17 +1601,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         )
     {
         Publish storage p = _publishes[orderId][seq];
-        return (
-            euint8.unwrap(p.handle),
-            p.kind,
-            euint64.unwrap(p.amount),
-            euint64.unwrap(p.paid),
-            p.depositor,
-            p.bondWei,
-            p.deadline,
-            p.settled,
-            p.bountyBps
-        );
+        return (p.handle, p.kind, p.amount, p.paid, p.depositor, p.bondWei, p.deadline, p.settled, p.bountyBps);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1643,9 +1633,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
                 bracket: o.bracket,
                 latestSeq: o.latestSeq,
                 publishedSeq: o.publishedSeq,
-                bracketHandle: euint8.unwrap(_publishes[orderId][o.latestSeq].handle),
-                remainingHandle: euint64.unwrap(o.eRemaining),
-                depositedHandle: euint64.unwrap(o.eDepositedAmount),
+                bracketHandle: _publishes[orderId][o.latestSeq].handle,
+                remainingHandle: o.eRemaining,
+                depositedHandle: o.eDepositedAmount,
                 active: o.active,
                 pending: o.pending,
                 closed: o.closed

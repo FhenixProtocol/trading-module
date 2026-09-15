@@ -1451,6 +1451,163 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // publish history — per-record kind / amount / paid
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("publish history", () => {
+    // PublishKind (uint8 enum → bigint over the wire).
+    const CREATE = 0n;
+    const FILL = 1n;
+    const TOP_UP = 2n;
+
+    /// Maker alice posts 1 mBTC ($65, NANO) @ PRICE_BTC_FUSD; bob holds `takerFusd`.
+    async function withOrder(takerFusd = 1_000n * ONE) {
+      const ctx = await setup();
+      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, takerFusd)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    async function expectAllowed(handle: string, who: string, allowed: boolean) {
+      const acl = await hre.cofhe.mocks.getMockACL();
+      expect(await acl.isAllowed.staticCall(BigInt(handle), who)).to.equal(allowed);
+    }
+
+    /// Maker records carry the shared `_E_ZERO64`, which anyone may decrypt.
+    async function expectPublicZero(handle: string) {
+      const acl = await hre.cofhe.mocks.getMockACL();
+      await hre.cofhe.mocks.expectPlaintext(handle, 0n);
+      expect(await acl.globalAllowed(BigInt(handle))).to.equal(true);
+    }
+
+    it("stamps the create record with the deposit and a public zero paid", async () => {
+      const { alice, bob, otc, id } = await withOrder();
+
+      const rec = await otc.getPublish(id, 1n);
+      expect(rec.kind).to.equal(CREATE);
+      expect(rec.depositor).to.equal(alice.address);
+      await hre.cofhe.mocks.expectPlaintext(rec.amount, mBTC);
+      expect(rec.amount).to.equal((await otc.getOrder(id)).depositedHandle); // same handle as the deposit
+      await expectPublicZero(rec.paid);
+
+      await expectAllowed(rec.amount, alice.address, true);
+      await expectAllowed(rec.amount, bob.address, false);
+    });
+
+    it("stamps a top-up record with its own delta, not the grown remaining, readable by the maker", async () => {
+      const { alice, bob, otc, aliceClient, id } = await withOrder();
+
+      await (await otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, 3n * mBTC, otc)))).wait();
+      const order = await otc.getOrder(id);
+      expect(order.latestSeq).to.equal(2n);
+      await hre.cofhe.mocks.expectPlaintext(order.remainingHandle, 4n * mBTC);
+
+      const rec = await otc.getPublish(id, order.latestSeq);
+      expect(rec.kind).to.equal(TOP_UP);
+      expect(rec.depositor).to.equal(alice.address);
+      expect(rec.bondWei).to.equal(0n);
+      await hre.cofhe.mocks.expectPlaintext(rec.amount, 3n * mBTC);
+      await expectPublicZero(rec.paid);
+
+      await expectAllowed(rec.amount, alice.address, true);
+      await expectAllowed(rec.amount, bob.address, false);
+    });
+
+    it("stamps a fill record with delivered input and paid output, readable by maker and taker only", async () => {
+      const { deployer, alice, bob, otc, bobClient, id } = await withOrder();
+
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      const rec = await otc.getPublish(id, seq);
+      expect(rec.kind).to.equal(FILL);
+      expect(rec.depositor).to.equal(bob.address);
+      await hre.cofhe.mocks.expectPlaintext(rec.amount, 400n);
+      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_400RAW_FUSD);
+
+      for (const handle of [rec.amount, rec.paid]) {
+        await expectAllowed(handle, alice.address, true);
+        await expectAllowed(handle, bob.address, true);
+        await expectAllowed(handle, deployer.address, false);
+      }
+    });
+
+    it("records the capped size and its cost when the taker over-requests", async () => {
+      const { bob, otc, bobClient, id } = await withOrder();
+
+      const seq = await fill(otc, bob, bobClient, id, 10n * mBTC); // only 1 mBTC remains
+      const rec = await otc.getPublish(id, seq);
+      await hre.cofhe.mocks.expectPlaintext(rec.amount, mBTC);
+      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_1MBTC_FUSD);
+    });
+
+    it("records zero amount and zero paid on an underpaid fill, still private to the parties", async () => {
+      const { deployer, alice, bob, otc, bobClient, id } = await withOrder(30n * ONE); // $30 < $65 cost
+      const acl = await hre.cofhe.mocks.getMockACL();
+
+      const seq = await fill(otc, bob, bobClient, id, mBTC);
+      const rec = await otc.getPublish(id, seq);
+      expect(rec.kind).to.equal(FILL);
+      await hre.cofhe.mocks.expectPlaintext(rec.amount, 0n);
+      await hre.cofhe.mocks.expectPlaintext(rec.paid, 0n);
+
+      // A real transfer result, not the shared public zero.
+      expect(await acl.globalAllowed(BigInt(rec.paid))).to.equal(false);
+      await expectAllowed(rec.paid, alice.address, true);
+      await expectAllowed(rec.paid, bob.address, true);
+      await expectAllowed(rec.paid, deployer.address, false);
+    });
+
+    it("reads an order's full history off seq 1..latestSeq", async () => {
+      const { alice, bob, otc, aliceClient, bobClient, id } = await withOrder();
+
+      await fill(otc, bob, bobClient, id, 400n);
+      await (await otc.connect(alice).topUpOrder(id, ...(await enc(aliceClient, mBTC, otc)))).wait();
+      await fill(otc, bob, bobClient, id, 200n);
+
+      const expected = [
+        { kind: CREATE, depositor: alice.address, amount: mBTC, paid: 0n },
+        { kind: FILL, depositor: bob.address, amount: 400n, paid: FILL_400RAW_FUSD },
+        { kind: TOP_UP, depositor: alice.address, amount: mBTC, paid: 0n },
+        { kind: FILL, depositor: bob.address, amount: 200n, paid: FILL_200RAW_FUSD },
+      ];
+      const latest = (await otc.getOrder(id)).latestSeq;
+      expect(latest).to.equal(BigInt(expected.length));
+
+      for (let seq = 1n; seq <= latest; seq++) {
+        const rec = await otc.getPublish(id, seq);
+        const want = expected[Number(seq - 1n)];
+        expect(rec.kind).to.equal(want.kind);
+        expect(rec.depositor).to.equal(want.depositor);
+        await hre.cofhe.mocks.expectPlaintext(rec.amount, want.amount);
+        await hre.cofhe.mocks.expectPlaintext(rec.paid, want.paid);
+      }
+    });
+
+    it("publishing a record settles it without touching kind, amount or paid", async () => {
+      const { bob, otc, bobClient, id } = await withOrder();
+
+      const seq = await fill(otc, bob, bobClient, id, 400n);
+      const before = await otc.getPublish(id, seq);
+      await publish(otc, bob, bobClient, id, seq);
+      const after = await otc.getPublish(id, seq);
+
+      expect(after.settled).to.equal(true);
+      expect([after.kind, after.amount, after.paid]).to.deep.equal([before.kind, before.amount, before.paid]);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // cANY<>cANY
   // ─────────────────────────────────────────────────────────────────────────
 

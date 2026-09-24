@@ -119,6 +119,7 @@ describe("ConfidentialOTC", () => {
 
     const otc = (await ethers.deployContract("ConfidentialOTC", [
       await fusd.getAddress(),
+      deployer.address,
     ])) as unknown as ConfidentialOTC;
     await otc.waitForDeployment();
 
@@ -300,8 +301,12 @@ describe("ConfidentialOTC", () => {
 
   describe("constructor", () => {
     it("reverts on zero fUSD address", async () => {
+      const [signer] = await ethers.getSigners();
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(ethers.ZeroAddress)).to.be.revertedWithCustomError(factory, "ZeroAddress");
+      await expect(factory.deploy(ethers.ZeroAddress, signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "ZeroAddress",
+      );
     });
 
     it("reverts when fUSD does not use exactly 6 decimals", async () => {
@@ -313,8 +318,12 @@ describe("ConfidentialOTC", () => {
       ])) as unknown as ConfidentialToken;
       await fusd18.waitForDeployment();
 
+      const [signer] = await ethers.getSigners();
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd18.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
+      await expect(factory.deploy(await fusd18.getAddress(), signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "InvalidDecimals",
+      );
     });
 
     // Dual-ledger fUSD (FUSDJmi shape): the public ledger is always 6 decimals, but the
@@ -323,17 +332,23 @@ describe("ConfidentialOTC", () => {
     // 4-decimal confidential fUSD would silently misprice every order by 100×. The public
     // `decimals()` check alone cannot catch this because it always reads 6.
     it("reverts when a dual-ledger fUSD's confidential layer is not 6 decimals (public is 6)", async () => {
+      const [signer] = await ethers.getSigners();
       const fusd = await deployDualLedger(4);
       expect(await fusd.confidentialDecimals()).to.equal(4);
 
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd.getAddress())).to.be.revertedWithCustomError(factory, "InvalidDecimals");
+      await expect(factory.deploy(await fusd.getAddress(), signer.address)).to.be.revertedWithCustomError(
+        factory,
+        "InvalidDecimals",
+      );
     });
 
     it("accepts a dual-ledger fUSD whose confidential layer is 6 decimals", async () => {
+      const [signer] = await ethers.getSigners();
       const fusd = await deployDualLedger(6);
       const otc = (await ethers.deployContract("ConfidentialOTC", [
         await fusd.getAddress(),
+        signer.address,
       ])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
 
@@ -648,6 +663,7 @@ describe("ConfidentialOTC", () => {
       await fusd.waitForDeployment();
       const otc = (await ethers.deployContract("ConfidentialOTC", [
         await fusd.getAddress(),
+        deployer.address,
       ])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
       await expect(otc.connect(deployer).ethBondSize()).to.be.revertedWithCustomError(otc, "EthOracleUnset");
@@ -2498,6 +2514,334 @@ describe("ConfidentialOTC", () => {
 
       await advance(1_000);
       expect(await otc.priceAge(ecbtcAddr)).to.be.greaterThanOrEqual(1_000n);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // protocol swap fee
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("protocol swap fee", () => {
+    const FEE_030 = 3_146n; // 0.30% in Q44.20
+    const MAX_FEE = 10_486n; // MAX_SWAP_FEE_Q20 (~1.00%)
+    const MAXU64 = (1n << 64n) - 1n;
+
+    /// Mirrors the contract's Q44.20 skim: eRelease × feeQ20 >> 20.
+    const feeOf = (amount: bigint, feeQ20: bigint) => (amount * feeQ20) >> 20n;
+
+    /// Mirrors _fillCap: the tighter of the price and fee overflow bounds. The
+    /// price bound reserves Q−1 of headroom for the ceil-rounding add in _swap.
+    const fillCap = (price: bigint, feeQ20: bigint) => {
+      let cap = (MAXU64 - (Q - 1n)) / price;
+      if (feeQ20 > 1n) {
+        const feeCap = MAXU64 / feeQ20;
+        if (feeCap < cap) cap = feeCap;
+      }
+      return cap;
+    };
+
+    /// Maker alice posts 1 mBTC of ecBTC for fUSD; bob funded to take it.
+    async function withOrder(feeQ20: bigint) {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      if (feeQ20 > 0n) {
+        await (await otc.connect(deployer).setSwapFee(feeQ20)).wait();
+      }
+
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+      return { ...ctx, id };
+    }
+
+    it("is disabled at deploy and leaves the fill path byte-for-byte unchanged", async () => {
+      const { deployer, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
+
+      expect(await otc.swapFeeQ20()).to.equal(0n);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Identical to the zero-fee expectations in the fillOrder suite.
+      await expectBalance(ecbtc, bob.address, mBTC);
+      await expectBalance(ecbtc, otcAddr, 0n);
+      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
+      // The feeQ20 == 0 fast path returns before touching _feesAccrued, so the
+      // slot is still the null handle and the sweep guard still fires.
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+    });
+
+    it("skims the fee from the taker and retains it in escrow", async () => {
+      const { alice, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee = feeOf(mBTC, FEE_030); // 1_000 raw @ 0.30% → 3 raw
+      expect(fee).to.equal(3n);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expectBalance(ecbtc, bob.address, mBTC - fee); // taker short by the fee
+      await expectBalance(ecbtc, otcAddr, fee); // fee stays put — no extra transfer
+      await expectBalance(fusd, alice.address, FILL_1MBTC_FUSD); // maker paid in full
+    });
+
+    it("decrements eRemaining by the full release, so the bracket is unaffected", async () => {
+      const { bob, otc, bobClient, ecbtcAddr, fusdAddr, id } = await withOrder(FEE_030);
+
+      // Order is fully consumed even though the taker received less than the
+      // release: eRemaining moves by eRelease, not eToTaker.
+      const value = await fillAndPublish(otc, bob, bobClient, id, mBTC);
+      expect(value).to.equal(EMPTY);
+
+      const order = await otc.getOrder(id);
+      expect(order.bracket).to.equal(EMPTY);
+      expect(order.active).to.equal(false);
+      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+    });
+
+    it("accrues across multiple fills", async () => {
+      const { bob, ecbtc, otc, bobClient, otcAddr, id } = await withOrder(FEE_030);
+
+      const fee1 = feeOf(400n, FEE_030);
+      const fee2 = feeOf(200n, FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await expectBalance(ecbtc, bob.address, 400n - fee1);
+
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await expectBalance(ecbtc, bob.address, 400n - fee1 + (200n - fee2));
+
+      // Escrow holds the untouched remainder plus both accrued fees.
+      await expectBalance(ecbtc, otcAddr, mBTC - 400n - 200n + fee1 + fee2);
+    });
+
+    it("charges nothing when the taker fails to pay in full", async () => {
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      await (await otc.connect(deployer).setSwapFee(FEE_030)).wait();
+      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      // Bob cannot cover $65 — the release is 0, so the fee must also be 0.
+      await (await fusd.mint(bob.address, 1n * ONE)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        PRICE_BTC_FUSD,
+        0n,
+        ...(await enc(aliceClient, mBTC, otc)),
+      );
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expectBalance(ecbtc, bob.address, 0n);
+      await expectBalance(ecbtc, otcAddr, mBTC); // escrow intact, nothing skimmed
+    });
+
+    it("clamps the fill so eRelease × fee cannot wrap uint64", async () => {
+      // price < swapFeeQ20 is the regime where the fee bound is the tighter of
+      // the two caps. At price=100 the old price-only cap was 1.84e17, and
+      // 1.84e17 × 10486 overflows uint64 — the fee bound is what prevents it.
+      const ctx = await setup();
+      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+
+      const price = 100n;
+      expect(price).to.be.lessThan(MAX_FEE); // fee bound binds
+      await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
+
+      const cap = fillCap(price, MAX_FEE);
+      const deposit = cap + 10n ** 12n; // more than the cap, so it must clamp
+      const output = (cap * price + Q - 1n) >> 20n; // taker pays the ceiling
+
+      await (await ecbtc.mint(alice.address, deposit)).wait();
+      await (await ecbtc.connect(alice).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await (await fusd.mint(bob.address, output)).wait();
+      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        ecbtcAddr,
+        fusdAddr,
+        price,
+        0n,
+        ...(await enc(aliceClient, deposit, otc)),
+      );
+
+      await fill(otc, bob, bobClient, id, deposit); // request everything
+
+      // eActual clamped to the fee bound; the fee is a sane ~1%, not a wrapped
+      // value, and the taker's receipt plus the retained fee reconstruct it.
+      const fee = feeOf(cap, MAX_FEE);
+      expect(fee).to.be.greaterThan(0n);
+      expect(fee).to.be.lessThan(cap);
+      await expectBalance(ecbtc, bob.address, cap - fee);
+      await expectBalance(ecbtc, otcAddr, deposit - cap + fee);
+    });
+
+    // ── admin surface ─────────────────────────────────────────────────────
+
+    it("only the owner may set the fee, and only up to MAX_SWAP_FEE_Q20", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      expect(await otc.MAX_SWAP_FEE_Q20()).to.equal(MAX_FEE);
+
+      await expect(otc.connect(alice).setSwapFee(FEE_030)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(otc.connect(deployer).setSwapFee(MAX_FEE + 1n)).to.be.revertedWithCustomError(otc, "FeeTooHigh");
+
+      await expect(otc.connect(deployer).setSwapFee(FEE_030)).to.emit(otc, "SwapFeeUpdated").withArgs(FEE_030);
+      expect(await otc.swapFeeQ20()).to.equal(FEE_030);
+
+      // The ceiling itself is allowed, and the fee can be switched back off.
+      await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
+      expect(await otc.swapFeeQ20()).to.equal(MAX_FEE);
+      await (await otc.connect(deployer).setSwapFee(0n)).wait();
+      expect(await otc.swapFeeQ20()).to.equal(0n);
+    });
+
+    it("publishes the fee handle so any account can read the live rate", async () => {
+      const { deployer, otc, bobClient } = await setup();
+
+      await (await otc.connect(deployer).setSwapFee(FEE_030)).wait();
+
+      // bob is unrelated to the fee, yet allowPublic lets him decrypt it.
+      const dec = await proof(bobClient, await otc.swapFeeHandle());
+      expect(BigInt(dec.decryptedValue)).to.equal(FEE_030);
+    });
+
+    it("defaults the treasury to the deployer and guards setTreasury", async () => {
+      const { deployer, alice, otc } = await setup();
+
+      expect(await otc.treasury()).to.equal(deployer.address);
+
+      await expect(otc.connect(alice).setTreasury(alice.address)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
+      await expect(otc.connect(deployer).setTreasury(ethers.ZeroAddress)).to.be.revertedWithCustomError(
+        otc,
+        "ZeroAddress",
+      );
+
+      await expect(otc.connect(deployer).setTreasury(alice.address))
+        .to.emit(otc, "TreasuryUpdated")
+        .withArgs(alice.address);
+      expect(await otc.treasury()).to.equal(alice.address);
+    });
+
+    // ── collection ────────────────────────────────────────────────────────
+
+    it("sweeps accrued fees to the treasury and cannot double-sweep", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      // Nothing accrued yet.
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+
+      const fee = feeOf(mBTC, FEE_030);
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Route the sweep to a signer holding no ecBTC — proves the destination
+      // follows `treasury` rather than the caller, and keeps the assertion exact
+      // (alice the maker, and bob the taker, both carry ecBTC of their own).
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
+      // The slot is reset to the zero handle, so the guard fires again — this
+      // is what would break if it were cleared with FHE.asEuint64(0).
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+    });
+
+    it("throttles sweeps to once per SWEEP_COOLDOWN, defeating the sandwich", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const cooldown = await otc.SWEEP_COOLDOWN();
+      expect(cooldown).to.equal(82_800n); // 23h
+
+      // First sweep is never blocked — no prior collection to wait on.
+      expect(await otc.lastSweepAt(ecbtcAddr)).to.equal(0n);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(0n);
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
+
+      const last = await otc.lastSweepAt(ecbtcAddr);
+      expect(last).to.be.greaterThan(0n);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(last + cooldown);
+
+      // The sandwich: a second fill lands, and the owner tries to collect again
+      // straight away to isolate that single fill's fee. Blocked.
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      const unlock = Number(await otc.sweepUnlockAt(ecbtcAddr));
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock - 1]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [unlock]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+    });
+
+    it("allows the next sweep once the cooldown elapses, aggregating the interim fills", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee1 = feeOf(400n, FEE_030);
+      const fee2 = feeOf(200n, FEE_030);
+      const fee3 = feeOf(100n, FEE_030);
+
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
+      await expectBalance(ecbtc, carol.address, fee1);
+
+      // Two more fills accrue while the sweep is locked.
+      await fillAndPublish(otc, bob, bobClient, id, 200n);
+      await fillAndPublish(otc, bob, bobClient, id, 100n);
+
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
+      await hre.network.provider.send("evm_mine");
+
+      await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
+
+      // The disclosed total is the SUM of both interim fills, not either alone.
+      await expectBalance(ecbtc, carol.address, fee1 + fee2 + fee3);
+      await expectBalance(ecbtc, otcAddr, mBTC - 400n - 200n - 100n);
+    });
+
+    it("only the owner may sweep", async () => {
+      const { alice, bob, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      await expect(otc.connect(alice).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(
+        otc,
+        "OwnableUnauthorizedAccount",
+      );
     });
   });
 });

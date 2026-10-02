@@ -5,6 +5,8 @@ import { Ownable } from '@openzeppelin/contracts/access/Ownable.sol';
 import { Pausable } from '@openzeppelin/contracts/utils/Pausable.sol';
 import { ReentrancyGuard } from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import { EnumerableSet } from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
+import { Math } from '@openzeppelin/contracts/utils/math/Math.sol';
+import { SafeCast } from '@openzeppelin/contracts/utils/math/SafeCast.sol';
 import { FHE, euint64, euint8, ebool, externalEuint64 } from '@fhenixprotocol/cofhe-contracts/FHE.sol';
 import { IFHERC20 } from '../interfaces/IFHERC20.sol';
 import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
@@ -137,11 +139,15 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// Maker creates an order specifying:
 ///   - inputToken  : whitelisted FHERC20 they are giving into escrow.
 ///   - outputToken : whitelisted FHERC20 they want in return.
-///   - price       : Q44.20 fixed-point rate — output units per input unit,
-///                   scaled by 2^20 (1_048_576). Examples:
-///                     $1.00  → 1_048_576
-///                     $0.50  → 524_288
-///                     $100   → 104_857_600
+///   - priceX64    : Q64.64 rate — raw output units per raw input unit, scaled
+///                   by 2^64. createOrder rounds it UP to a PRICE_BITS-bit
+///                   mantissa `price` with a per-order binary point
+///                   `priceShift` (rate = price / 2^priceShift), so every order
+///                   quotes to ~0.2 bp whatever its magnitude. Examples with
+///                   6-decimal legs:
+///                     sell cBTC for fUSD at $84,000 → 84_000 << 64       → 84_000 / 2^0
+///                     buy cBTC with fUSD at $84,000 → (1 << 64) / 84_000 → 51_131 / 2^32
+///                     $1.00                         → 1 << 64            → 32_768 / 2^15
 ///   - expiry      : unix timestamp after which the order can no longer be
 ///                   filled. 0 = good-til-cancelled (never expires).
 ///   - encAmount   : encrypted input token quantity handle, with its `inputProof`
@@ -163,7 +169,7 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// ──────────────────────────────────────────────────────────────────────────
 ///
 ///   encTokensWanted → eActual = min(eTokensWanted, eRemaining, overflowCap)
-///   eOutput         = eActual × price >> 20            // Q44.20
+///   eOutput         = (eActual × price + 2^priceShift - 1) >> priceShift   // rounded up
 ///   eOutputPaid     = outputToken.transferFrom(taker, maker, eOutput)
 ///   paidInFull      = (eOutputPaid == eOutput) && (eOutput > 0)
 ///   eRelease        = paidInFull ? eActual : 0
@@ -234,6 +240,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @dev Q44.20 price denominator: 2^20 = 1_048_576.
     uint64 public constant Q_DENOM = 1_048_576;
+
+    /// @dev Significant bits kept in an order's price mantissa. {createOrder}
+    ///      rounds every Q64.64 price to this width, so each order quotes to
+    ///      ~2^-16 (≈ 0.2 bp) whatever its magnitude, and a fill's amount keeps
+    ///      the other 48 bits of the 64-bit encrypted multiply.
+    uint8 public constant PRICE_BITS = 16;
 
     /// @dev fUSD's confidential ledger must use exactly this many decimals —
     ///      the bracket thresholds below are denominated in 6-decimal fUSD units.
@@ -312,9 +324,14 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @dev Precomputed encrypted zero, reused for comparisons and fallbacks.
     euint64 private immutable _E_ZERO64;
 
-    /// @dev Q_DENOM - 1, added before the Q44.20 right-shift so the taker's
-    ///      obligation rounds up instead of down. See {_swap}.
-    euint64 private immutable _E_Q_MASK;
+    /// @dev Encrypted right-shift operand per order `priceShift`, cached by
+    ///      {createOrder} the first time a shift is used, so a fill loads it
+    ///      instead of paying for a fresh trivial encryption.
+    mapping(uint8 => euint64) private _eShift;
+
+    /// @dev 2^shift - 1 per cached shift, added before the right-shift so the
+    ///      taker's obligation rounds up instead of down. See {_swap}.
+    mapping(uint8 => euint64) private _eShiftMask;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Token whitelist & oracle
@@ -458,8 +475,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         ///      FHE.allow'd to the maker; divide eRemaining by this to track
         ///      fill progress across top-ups.
         euint64 eDepositedAmount;
-        /// @dev Q44.20 price: output units per input unit × 2^20.
+        /// @dev Price mantissa: output units per input unit × 2^priceShift.
         uint64 price;
+        /// @dev Binary point of `price` (0–63), chosen by {createOrder}.
+        uint8 priceShift;
         /// @dev Unix timestamp after which the order cannot be filled.
         ///      0 = good-til-cancelled.
         uint64 expiry;
@@ -551,8 +570,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         address inputToken;
         /// @dev Requested token leg.
         address outputToken;
-        /// @dev Q44.20 order price (output per input).
+        /// @dev Order price mantissa (output per input × 2^priceShift).
         uint64 price;
+        /// @dev Binary point of `price`.
+        uint8 priceShift;
         /// @dev Expiry timestamp (0 = good-til-cancelled).
         uint64 expiry;
         /// @dev Plaintext published bracket (0–5), or BRACKET_UNPUBLISHED.
@@ -624,7 +645,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param  maker       The order creator.
     /// @param  inputToken  The escrowed token leg.
     /// @param  outputToken The requested token leg.
-    /// @param  price       The Q44.20 order price (output per input).
+    /// @param  price       The order price mantissa (output per input × 2^priceShift).
+    /// @param  priceShift  The binary point of `price`.
     /// @param  expiry      The expiry timestamp (0 = good-til-cancelled).
     event OrderCreated(
         uint256 indexed orderId,
@@ -632,6 +654,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         address indexed inputToken,
         address outputToken,
         uint64 price,
+        uint8 priceShift,
         uint64 expiry
     );
 
@@ -781,7 +804,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         _E_SHR_20 = FHE.asEuint64(20);
         _E_ZERO64 = FHE.asEuint64(0);
-        _E_Q_MASK = FHE.asEuint64(Q_DENOM - 1);
 
         // Persist ACL on every reused handle so they remain usable as operands
         // in later transactions (the auto-grant from FHE.asEuint* is transient).
@@ -793,7 +815,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(_E_BRACKET_WHALE);
         FHE.allowThis(_E_SHR_20);
         FHE.allowThis(_E_ZERO64);
-        FHE.allowThis(_E_Q_MASK);
 
         treasury = treasury_;
         emit TreasuryUpdated(treasury_);
@@ -1224,7 +1245,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///
     /// @param inputToken  Whitelisted FHERC20 the maker is offering (escrowed here).
     /// @param outputToken Whitelisted FHERC20 the maker wants in return.
-    /// @param price       Q44.20 rate: output per input, scaled by 2^20.
+    /// @param priceX64    Q64.64 rate: raw output per raw input, scaled by 2^64.
+    ///                    Stored rounded up to a PRICE_BITS-bit mantissa (see
+    ///                    {_normalizePrice}).
     /// @param expiry      Unix timestamp after which the order can no longer be
     ///                    filled. Pass 0 for good-til-cancelled.
     /// @param encAmount   Encrypted input amount handle, signed for this contract.
@@ -1233,7 +1256,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     function createOrder(
         IFHERC20 inputToken,
         IFHERC20 outputToken,
-        uint64 price,
+        uint128 priceX64,
         uint64 expiry,
         externalEuint64 encAmount,
         bytes calldata inputProof
@@ -1241,7 +1264,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (address(inputToken) == address(0) || address(outputToken) == address(0)) revert ZeroAddress();
         if (address(inputToken) == address(outputToken)) revert SameLeg();
         _requireWhitelisted(address(inputToken), address(outputToken));
-        if (price == 0) revert ZeroPrice();
+        if (priceX64 == 0) revert ZeroPrice();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
         // Maker bond (optional anti-spam lever; usually 0).
@@ -1271,7 +1294,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         o.outputToken = outputToken;
         o.eRemaining = actual;
         o.eDepositedAmount = actual; // same handle; ACL already granted above
-        o.price = price;
+        (o.price, o.priceShift) = _normalizePrice(priceX64);
+        _cacheShift(o.priceShift);
         o.expiry = expiry;
         o.bracket = BRACKET_UNPUBLISHED;
         o.latestSeq = CREATE_SEQ;
@@ -1303,7 +1327,41 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         if (msg.value > bond) _payEth(msg.sender, msg.value - bond);
 
-        emit OrderCreated(orderId, msg.sender, address(inputToken), address(outputToken), price, expiry);
+        emit OrderCreated(
+            orderId, msg.sender, address(inputToken), address(outputToken), o.price, o.priceShift, expiry
+        );
+    }
+
+    /// @dev Rounds a Q64.64 price up to a PRICE_BITS-bit mantissa and picks its
+    ///      binary point, so every order keeps the same relative precision
+    ///      whatever its magnitude: a $84,000 BTC bid (2^64 / 84,000) stores as
+    ///      51,131 / 2^32. Rates of 2^15 or more keep shift 0 and their whole
+    ///      integer part; rates below 2^-48 clamp at shift 63 with a narrower
+    ///      mantissa. Rounding up means the stored rate never undercuts the
+    ///      maker. Only a rate above 2^64 - 1 rounds past the mantissa — one no
+    ///      fill could ever pay — and SafeCast rejects it.
+    /// @param  priceX64 Raw output per raw input, scaled by 2^64 (non-zero).
+    /// @return price    The mantissa.
+    /// @return shift    Its binary point: rate = price / 2^shift.
+    function _normalizePrice(uint128 priceX64) internal pure returns (uint64 price, uint8 shift) {
+        uint256 msb = Math.log2(priceX64);
+        shift = uint8(msb >= PRICE_BITS + 63 ? 0 : Math.min(63, PRICE_BITS + 63 - msb));
+        uint256 drop = 64 - shift;
+        price = SafeCast.toUint64((uint256(priceX64) + (1 << drop) - 1) >> drop);
+    }
+
+    /// @dev Encrypts and ACL-persists the right-shift operand and round-up mask
+    ///      for `shift` the first time any order uses it. Handles are never
+    ///      cleared, so every live order's shift stays cached for its fills.
+    /// @param shift The order's priceShift (0–63).
+    function _cacheShift(uint8 shift) internal {
+        if (euint64.unwrap(_eShift[shift]) != 0) return;
+        euint64 eShift = FHE.asEuint64(shift);
+        euint64 eMask = FHE.asEuint64((uint64(1) << shift) - 1);
+        FHE.allowThis(eShift);
+        FHE.allowThis(eMask);
+        _eShift[shift] = eShift;
+        _eShiftMask[shift] = eMask;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1471,14 +1529,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ) internal returns (euint64 eDelivered, euint64 eOutputPaid) {
         // Cap requested amount at available remaining and the overflow bound.
         // FHE.mul/add are mod 2^64; cap so neither eActual × price (+ the
-        // Q_DENOM-1 ceil term below) nor the downstream eRelease × fee wraps.
+        // 2^priceShift - 1 ceil term below) nor the downstream eRelease × fee wraps.
         euint64 eActual = FHE.min(FHE.asEuint64(encTokensWanted, inputProof), o.eRemaining);
-        eActual = FHE.min(eActual, FHE.asEuint64(_fillCap(o.price)));
+        eActual = FHE.min(eActual, FHE.asEuint64(_fillCap(o.price, o.priceShift)));
         FHE.allowThis(eActual);
 
         // Rounded UP, so the sub-unit residue is charged to the taker rather
         // than gifted to them — it is the maker's, and up to one raw unit/fill.
-        euint64 eOutput = FHE.shr(FHE.add(FHE.mul(eActual, FHE.asEuint64(o.price)), _E_Q_MASK), _E_SHR_20);
+        euint64 eOutput = FHE.shr(
+            FHE.add(FHE.mul(eActual, FHE.asEuint64(o.price)), _eShiftMask[o.priceShift]),
+            _eShift[o.priceShift]
+        );
         FHE.allowThis(eOutput);
 
         // Pull output from taker directly to maker (no intermediate escrow).
@@ -1566,14 +1627,16 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @dev The plaintext ceiling a fill's input amount is clamped to, so no
     ///      downstream FHE multiply wraps uint64. Two bounds, whichever binds:
-    ///      the Q44.20 price multiply in {_swap} — which reserves Q_DENOM-1 of
+    ///      the price multiply in {_swap} — which reserves 2^shift - 1 of
     ///      headroom for the ceil-rounding add that follows it — and the fee
     ///      multiply in {_takeFee}. At MAX_SWAP_FEE_Q20 the fee bound is ~1.76e15,
-    ///      so it only becomes the tighter of the two at very low prices.
-    /// @param  price The order's Q44.20 price.
+    ///      while a PRICE_BITS-wide mantissa keeps the price bound under 2^49, so
+    ///      the fee bound only binds for a rate small enough to clamp at shift 63.
+    /// @param  price The order's price mantissa.
+    /// @param  shift The order's priceShift.
     /// @return cap   The maximum input amount safe to process.
-    function _fillCap(uint64 price) internal view returns (uint64 cap) {
-        cap = (type(uint64).max - (Q_DENOM - 1)) / price;
+    function _fillCap(uint64 price, uint8 shift) internal view returns (uint64 cap) {
+        cap = (type(uint64).max - ((uint64(1) << shift) - 1)) / price;
         uint64 feeQ20 = swapFeeQ20;
         if (feeQ20 > 1) {
             uint64 feeCap = type(uint64).max / feeQ20;
@@ -1905,6 +1968,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
                 inputToken: address(o.inputToken),
                 outputToken: address(o.outputToken),
                 price: o.price,
+                priceShift: o.priceShift,
                 expiry: o.expiry,
                 bracket: o.bracket,
                 latestSeq: o.latestSeq,

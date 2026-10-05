@@ -143,8 +143,9 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 ///                   by 2^64. createOrder rounds it UP to a PRICE_BITS-bit
 ///                   mantissa `price` with a per-order binary point
 ///                   `priceShift` (rate = price / 2^priceShift), so every order
-///                   quotes to ~0.2 bp whatever its magnitude. Examples with
-///                   6-decimal legs:
+///                   quotes to ~0.2 bp for any rate ≥ 2^-48; below that the
+///                   shift clamps at 63 and rounding is one Q64.64 step.
+///                   Examples with 6-decimal legs:
 ///                     sell cBTC for fUSD at $84,000 → 84_000 << 64       → 84_000 / 2^0
 ///                     buy cBTC with fUSD at $84,000 → (1 << 64) / 84_000 → 51_131 / 2^32
 ///                     $1.00                         → 1 << 64            → 32_768 / 2^15
@@ -243,8 +244,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @dev Significant bits kept in an order's price mantissa. {createOrder}
     ///      rounds every Q64.64 price to this width, so each order quotes to
-    ///      ~2^-16 (≈ 0.2 bp) whatever its magnitude, and a fill's amount keeps
-    ///      the other 48 bits of the 64-bit encrypted multiply.
+    ///      ~2^-16 (≈ 0.2 bp) for any rate ≥ 2^-48, and a fill's amount keeps
+    ///      the other 48 bits of the 64-bit encrypted multiply. Below 2^-48 the
+    ///      shift clamps at 63 and rounding is one Q64.64 step.
     uint8 public constant PRICE_BITS = 16;
 
     /// @dev fUSD's confidential ledger must use exactly this many decimals —

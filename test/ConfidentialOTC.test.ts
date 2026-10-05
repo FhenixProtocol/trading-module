@@ -1141,6 +1141,125 @@ describe("ConfidentialOTC", () => {
         await expectStored(otc, id, price, shift);
       }
     });
+
+    // A rate below 2^-48 has fewer than 16 significant bits even as Q64.64
+    // calldata, so shift 63 (drop 1) can only round priceX64 up to even: at
+    // most one Q64.64 step, a relative error of 1 / priceX64.
+    it("rounds a sub-2^-48 priceX64 up to even at shift 63, at most one Q64.64 step", async () => {
+      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, fusd, 0n, fusd, 1_000n * ONE, otcAddr);
+
+      const cases: [bigint, bigint][] = [
+        // [priceX64, stored price] — all at shift 63, so the stored rate is 2 × price / 2^64
+        [1n << 16n, 1n << 15n], // rate 2^-48: the last full 16-bit mantissa, exact
+        [(1n << 16n) + 1n, (1n << 15n) + 1n], // odd: +1 step = +0.15 bp
+        [21_961n, 10_981n], // a 0-decimal BTC for a $0.0001 token, see below: +0.46 bp
+        [3n, 2n], // +1 step = +33%, but a rate of 1.6e-19 is not a real market
+      ];
+      for (const [priceX64, price] of cases) {
+        const id = await createOrder(
+          otc,
+          alice,
+          fusdAddr,
+          ecbtcAddr,
+          priceX64,
+          0n,
+          ...(await enc(aliceClient, ONE, otc)),
+        );
+        await expectStored(otc, id, price, 63n);
+        expect(2n * price - priceX64).to.equal(priceX64 % 2n);
+      }
+    });
+
+    // One raw unit of a 0-decimal BTC is 1 BTC ($84,000) and one raw unit of a
+    // 6-decimal $0.0001 token is $0.0000000001, so the rate is 1 / 8.4e14 ≈
+    // 1.19e-15, below 2^-48 ≈ 3.55e-15. It stores as 10_980 / 2^63, exact, and
+    // _fillCap (8.40016e14) still covers the whole order. At shift s a fill
+    // outputs at most ~2^(64 − s) raw units, so here every fill outputs exactly
+    // 1 BTC: the rounded-up output, not the mantissa, sets what a taker pays.
+    it("sells $84,000 of a $0.0001 token for 1 0-decimal BTC; each split fill costs a whole BTC", async () => {
+      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr } = await setup();
+      const { token: t, addr: tAddr } = await listToken(otc, "T", 6, 104n); // floor($0.0001 × 2^20)
+      const { token: btc0, addr: btc0Addr } = await listToken(otc, "cBTC0", 0, BTC_USD * Q);
+
+      const escrow = 840_000_000_000_000n; // 840M T = $84,000
+      await fundMaker(alice, t, escrow, fusd, 0n, otcAddr);
+      await fundMaker(bob, btc0, 2n, fusd, 0n, otcAddr);
+
+      const id = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        tAddr,
+        btc0Addr,
+        X64 / escrow,
+        0n,
+        ...(await enc(aliceClient, escrow, otc)),
+      );
+      await expectStored(otc, id, 10_980n, 63n);
+
+      // Half the order is worth 0.5 BTC, but 0.5 raw output rounds up to 1.
+      await fill(otc, bob, bobClient, id, escrow / 2n);
+      await expectBalance(t, bob.address, escrow / 2n);
+      await expectBalance(btc0, alice.address, 1n);
+
+      // The other half costs another whole BTC: the maker collects 2 BTC for $84,000.
+      await fill(otc, bob, bobClient, id, escrow / 2n);
+      await expectBalance(t, bob.address, escrow);
+      await expectBalance(btc0, alice.address, 2n);
+      await expectBalance(btc0, bob.address, 0n);
+    });
+
+    // The encrypted shift and mask at both ends of their range. A fill at
+    // _fillCap puts eActual × price + mask exactly on 2^64 − 1 before the
+    // shift, so one unit less headroom would wrap and release nothing. This
+    // covers the mock's shr, a plain `>>`; the coprocessor needs a testnet fill.
+    it("runs FHE.shr at shift 0 and shift 63 with the sum on 2^64 − 1, without wrapping", async () => {
+      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr } = await setup();
+      const { token: a, addr: aAddr } = await listToken(otc, "A", 6, Q);
+      const { token: b, addr: bAddr } = await listToken(otc, "B", 6, Q);
+      const HALF = 1n << 63n;
+
+      await fundMaker(alice, a, HALF + 1n, fusd, 0n, otcAddr);
+      await fundMaker(bob, b, U64_MAX, fusd, 1n, otcAddr);
+
+      // Shift 0, mask 0: price 2^64 − 1, so _fillCap is 1 raw unit.
+      const id0 = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        aAddr,
+        bAddr,
+        U64_MAX * X64,
+        0n,
+        ...(await enc(aliceClient, 1n, otc)),
+      );
+      await expectStored(otc, id0, U64_MAX, 0n);
+      await fill(otc, bob, bobClient, id0, 5n);
+      await expectBalance(a, bob.address, 1n);
+      await expectBalance(b, alice.address, U64_MAX);
+      await expectBalance(b, bob.address, 0n);
+
+      // Shift 63, mask 2^63 − 1: priceX64 = 1 stores 1 / 2^63, so _fillCap is
+      // 2^63 and 2^63 × 1 + (2^63 − 1) = 2^64 − 1. The output is 1 raw unit.
+      // At the maker's quote of 2^-64 that unit would buy 2^64 raw, so the
+      // stored rate is twice the quote.
+      const id63 = await createAndActivate(
+        otc,
+        alice,
+        aliceClient,
+        aAddr,
+        fusdAddr,
+        1n,
+        0n,
+        ...(await enc(aliceClient, HALF, otc)),
+      );
+      await expectStored(otc, id63, 1n, 63n);
+      await fill(otc, bob, bobClient, id63, U64_MAX);
+      await expectBalance(a, bob.address, HALF + 1n);
+      await expectBalance(fusd, alice.address, 1n);
+      await expectBalance(fusd, bob.address, 0n);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────

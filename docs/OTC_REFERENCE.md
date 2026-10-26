@@ -419,6 +419,14 @@ publishedSeq`; listing changes only on the frontier.
   eviction.
 - **Per-fill size ceiling** ≈ $17.6M-equivalent (64-bit Q44.20). Large trades must
   be split across fills.
+- **Clamped fills can overpay by one raw output unit.** A fill request above the
+  order's remaining size (which only the maker can see) is clamped, and the
+  taker's payment is rounded up to a whole raw unit of the output token. A fill
+  clamped to a dust remainder therefore costs at least one raw output unit. At 6
+  decimals that is cents; for a 0-decimal output token it is a whole coin. The
+  maker can force it by draining their own order from a second address just
+  before a taker's fill. Accepted: listing coarse-decimal tokens is an owner
+  decision, and takers on such pairs carry this risk.
 - **Oracle latency** can transiently misclassify a bracket between price updates.
 - **Bracket granularity** is coarse by design (6 tiers); it is an indicator, not a
   precise size.

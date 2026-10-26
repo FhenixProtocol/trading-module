@@ -215,6 +215,11 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// is 0 and the escrow is untouched. This prevents a taker from draining input
 /// without paying. Takers must size their request to what they can afford.
 ///
+/// A request above `eRemaining` (visible only to the maker) is clamped, and
+/// the payment is rounded up, so a clamped fill can cost up to one raw output
+/// unit more than the input it releases is worth. Negligible at 6 decimals,
+/// but a whole coin when the output token has 0 decimals.
+///
 /// Taker must have set the OTC as operator on their outputToken before calling
 /// fillOrder, and must call `publishBracket` afterward (within the grace window)
 /// to reveal the new bracket and reclaim their bond.
@@ -832,6 +837,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Whitelist a token, enabling it as an input or output leg.
     /// @dev    Enforces MAX_TOKEN_DECIMALS on the token's confidential ledger (see
     ///         {_confidentialDecimals}) so createOrder never needs to re-check.
+    ///
+    ///         Prefer tokens with exactly 6 confidential decimals, and list
+    ///         fewer only rarely, after weighing the raw unit's value. A
+    ///         clamped fill can overpay by up to one raw output unit.
     /// @param  token        The token to whitelist.
     /// @param  initialPrice The token's initial Q44.20 oracle price (≥ MIN_ORACLE_PRICE).
     function whitelistToken(address token, uint64 initialPrice) external onlyOwner {
@@ -1464,7 +1473,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///
     /// @dev    Taker must have called `outputToken.setOperator(address(this), …)`
     ///         before calling this function. Send at least `ethBondSize()` wei;
-    ///         any excess is refunded.
+    ///         any excess is refunded. A request above the remaining size is
+    ///         clamped and may overpay by up to one raw output unit.
     ///
     /// @param orderId         The order to fill against.
     /// @param encTokensWanted Encrypted amount of inputToken the taker wants.

@@ -138,7 +138,7 @@ Grouped by role; each maps directly to contract behavior.
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Bracket**        | Coarse size tier (0–5) of the order's remaining USD-equivalent value. `255` = unpublished.                                                        |
 | **fUSD**           | The confidential stablecoin; the bracket unit of account (oracle price fixed at $1).                                                              |
-| **Q44.20**         | Fixed-point format: value × `2^20`. Used for prices and oracle prices.                                                                            |
+| **Q44.20**         | Fixed-point format: value × `2^20`. Used for oracle prices and the fee.                                                                            |
 | **seq**            | Monotonic per-order sequence number; one per state-changing action (create/fill/top-up).                                                          |
 | **Publish record** | An immutable bracket snapshot for a given `seq`, plus its bond metadata.                                                                          |
 | **Frontier**       | The latest record (`seq == latestSeq`); only its publish changes listing.                                                                         |
@@ -259,22 +259,30 @@ is swallowed — it still settles `fillA`'s bond, it just doesn't change the bra
 
 ## 8. Pricing & brackets
 
-### Price (Q44.20)
+### Price (Q64.64 in, mantissa + shift stored)
 
-`price` is `uint64`, scaled by `Q_DENOM = 2^20 = 1_048_576`, expressing **output
-units per input unit**. Output is computed under FHE as `eOutput = eActual ×
-price >> 20`.
+`createOrder` takes `priceX64`, a Q64.64 rate of **raw output units per raw input
+unit** (× 2^64), and stores it rounded up as a 16-bit mantissa `price` with a
+per-order binary point `priceShift` (rate = `price / 2^priceShift`). Output is
+computed under FHE as `eOutput = (eActual × price + 2^priceShift − 1) >>
+priceShift`, rounded up.
 
-| Human rate | `price`         |
-| ---------- | --------------- |
-| $1.00      | `1_048_576`     |
-| $0.50      | `524_288`       |
-| $100       | `104_857_600`   |
-| $1,500     | `1_572_864_000` |
+| Rate (6-decimal legs)         | `priceX64`           | stored          |
+| ----------------------------- | -------------------- | --------------- |
+| sell cBTC for fUSD at $84,000 | `84_000 << 64`       | `84_000 / 2^0`  |
+| buy cBTC with fUSD at $84,000 | `(1 << 64) / 84_000` | `51_131 / 2^32` |
+| $1.00                         | `1 << 64`            | `32_768 / 2^15` |
 
-Per-fill input is capped to `type(uint64).max / price` so `eActual × price` never
-wraps (≈ $17.6M-equivalent per fill at 64-bit width; total order size across many
-fills is unbounded).
+Per-fill input is capped (`_fillCap`) so `eActual × price` never wraps. The cap
+counts **raw input units**: under 2^49 whenever `priceShift > 0`. That is ~$281M
+of fUSD per fill, but only a few $k of a $0.00001 token, so cheap inputs fill in
+many pieces. Total order size across fills is unbounded.
+
+`createOrder` reverts `PriceTooLow` for a rate so small (below 5,243 / 2^63 ≈
+5.7e-16 raw output per raw input) that the
+fee multiply at `MAX_SWAP_FEE_Q20` would need a tighter cap than the price one:
+such a fill would buy less than one raw output unit yet pay a whole one. Checked
+at the maximum fee, so raising the fee never changes an existing order's cap.
 
 ### Bracket tiers
 
@@ -356,7 +364,7 @@ true current tier.
 > `OrderDelisted` / `OrderCancelled` (update/leave). `OrderFilled` /
 > `OrderToppedUp` carry the `seq` that still needs a publish.
 
-**Errors:** `ZeroAddress`, `SameLeg`, `ZeroPrice`, `InvalidDecimals`,
+**Errors:** `ZeroAddress`, `SameLeg`, `ZeroPrice`, `PriceTooLow`, `InvalidDecimals`,
 `InvalidExpiry`, `TokenNotWhitelisted`, `Unauthorized`, `OrderNotFound`,
 `OrderNotActive`, `OrderClosed`, `OrderExpired`, `NotMaker`, `LengthMismatch`,
 `EthOracleUnset`, `WrongBond`, `PublishNotFound`, `AlreadySettled`, `NotInWindow`,
@@ -367,7 +375,9 @@ true current tier.
 ## 13. Security properties & invariants
 
 - **No free fills:** input released only on full, non-zero payment (`paidInFull`).
-- **No silent overflow:** per-fill input capped to `type(uint64).max / price`.
+- **No silent overflow:** per-fill input capped by `_fillCap` so the price
+  multiply cannot wrap, and `createOrder` rejects rates (`PriceTooLow`) whose cap
+  the fee multiply at `MAX_SWAP_FEE_Q20` could wrap.
 - **No maker self-reporting:** brackets derive from the real encrypted value.
 - **Bracket monotonicity:** canonical bracket only advances on `seq >
 publishedSeq`; listing changes only on the frontier.
@@ -417,8 +427,10 @@ publishedSeq`; listing changes only on the frontier.
 - **Expired orders linger** in the pair index until the maker cancels (expiry is
   public, so the frontend filters them trivially). No permissionless expiry
   eviction.
-- **Per-fill size ceiling** ≈ $17.6M-equivalent (64-bit Q44.20). Large trades must
-  be split across fills.
+- **Per-fill size ceiling** of ~2^48 raw input units (64-bit multiply with a
+  16-bit mantissa). Fine for fUSD (~$281M) and BTC, but a trade in a very cheap
+  input token (e.g. $0.00001) is capped at a few $k per fill and must be split,
+  each fill paying its own gas and bond.
 - **Clamped fills can overpay by one raw output unit.** A fill request above the
   order's remaining size (which only the maker can see) is clamped, and the
   taker's payment is rounded up to a whole raw unit of the output token. A fill

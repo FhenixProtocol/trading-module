@@ -201,8 +201,8 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// (`_eSwapFeeQ20`). The ciphertext is cached so a fill loads a handle rather
 /// than paying for a fresh trivial encryption, and is `allowPublic`'d so anyone
 /// may read the live fee. The plaintext mirror is not redundant: the fee is
-/// public policy, and it is the only way to derive the overflow cap and to take
-/// the zero-fee fast path — you cannot branch on a ciphertext.
+/// public policy, and it is the only way to take the zero-fee fast path — you
+/// cannot branch on a ciphertext.
 ///
 /// Accrued fees are swept by the owner via `sweepFees(token)` to `treasury`,
 /// at most once per SWEEP_COOLDOWN (23h) per token, the first sweep counted
@@ -275,7 +275,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      Realistic OTC taker fees sit at 0.05–0.30%, so this leaves ample
     ///      headroom while bounding how far governance can move the fee against
     ///      takers. It also keeps the `eRelease × fee` overflow bound (see
-    ///      {_fillCap}) around 1.76e15 raw units (~$1.76bn at 6 decimals).
+    ///      {_fillCap}) around 1.76e15 raw input units per fill (~$1.76bn of
+    ///      a $1, 6-decimal token; far less for a cheap one).
     uint64 public constant MAX_SWAP_FEE_Q20 = 10_486;
 
     /// @dev Minimum interval between fee sweeps of the same token. Deliberately
@@ -434,11 +435,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Protocol swap fee, Q44.20 (fraction of the released input skimmed
     ///         from the taker). 0 = disabled, which is the deployed default.
     /// @dev    Deliberately plaintext: the fee is public policy, and a plaintext
-    ///         mirror buys two things an `euint64` cannot. It lets {_fillCap}
-    ///         derive the overflow bound without a decryption, and it lets
-    ///         {_takeFee} branch — you cannot branch on an encrypted value, so
-    ///         without this mirror a zero fee would still pay for the full FHE
-    ///         mul/shr/sub/add on every fill.
+    ///         mirror lets {_takeFee} branch — you cannot branch on an
+    ///         encrypted value, so without it a zero fee would still pay for
+    ///         the full FHE mul/shr/sub/add on every fill.
     uint64 public swapFeeQ20;
 
     /// @dev Encrypted mirror of {swapFeeQ20}, cached so each fill loads a handle
@@ -730,6 +729,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     error SameLeg();
     /// @notice A price or oracle price was zero / below MIN_ORACLE_PRICE.
     error ZeroPrice();
+    /// @notice The rate is so low that, at MAX_SWAP_FEE_Q20, a fill would be
+    ///         capped below one raw output unit but still pay a whole one.
+    error PriceTooLow();
     /// @notice A token's confidential-ledger decimals are incompatible (fUSD != 6, or token > 6).
     error InvalidDecimals();
     /// @notice The supplied expiry is already in the past.
@@ -1255,8 +1257,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param outputToken Whitelisted FHERC20 the maker wants in return.
     /// @param priceX64    Q64.64 rate: raw output per raw input, scaled by 2^64.
     ///                    Stored rounded up to a PRICE_BITS-bit mantissa (see
-    ///                    {_normalizePrice}).
-    /// @param expiry      Unix timestamp after which the order can no longer be
+    ///                    {_normalizePrice}). Rejected if the fee multiply at
+    ///                    MAX_SWAP_FEE_Q20 would need a smaller cap than
+    ///                    {_fillCap}: such a fill buys less than one raw output
+    ///                    unit yet pays a whole one.
+    /// @param expiry     Unix timestamp after which the order can no longer be
     ///                    filled. Pass 0 for good-til-cancelled.
     /// @param encAmount   Encrypted input amount handle, signed for this contract.
     /// @param inputProof  Batch signature covering `encAmount`, bound to this contract.
@@ -1273,6 +1278,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (address(inputToken) == address(outputToken)) revert SameLeg();
         _requireWhitelisted(address(inputToken), address(outputToken));
         if (priceX64 == 0) revert ZeroPrice();
+        (uint64 price, uint8 shift) = _normalizePrice(priceX64);
+        if (_fillCap(price, shift) > type(uint64).max / MAX_SWAP_FEE_Q20) revert PriceTooLow();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
         // Maker bond (optional anti-spam lever; usually 0).
@@ -1302,8 +1309,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         o.outputToken = outputToken;
         o.eRemaining = actual;
         o.eDepositedAmount = actual; // same handle; ACL already granted above
-        (o.price, o.priceShift) = _normalizePrice(priceX64);
-        _cacheShift(o.priceShift);
+        o.price = price;
+        o.priceShift = shift;
+        _cacheShift(shift);
         o.expiry = expiry;
         o.bracket = BRACKET_UNPUBLISHED;
         o.latestSeq = CREATE_SEQ;
@@ -1612,9 +1620,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      below is mod 2^64, so a larger release wraps and silently accrues
     ///      less than the configured rate — no revert, and the books stay
     ///      self-consistent, so nothing surfaces the shortfall. {_swap}
-    ///      guarantees this by clamping the fill through {_fillCap}, whose fee
-    ///      bound is exactly this limit; the clamp is applied to the fill size
-    ///      rather than here so the fee stays exact instead of truncated. Any
+    ///      guarantees this by clamping the fill through {_fillCap}, which
+    ///      {createOrder} keeps within `type(uint64).max / MAX_SWAP_FEE_Q20`
+    ///      for every order, so it holds at any fee the owner can set. Any
     ///      new caller must clamp equivalently — do not rely on this one.
     /// @param  token     The input token the fee is denominated in.
     /// @param  eRelease  The encrypted input released by the fill.
@@ -1636,23 +1644,20 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(eToTaker);
     }
 
-    /// @dev The plaintext ceiling a fill's input amount is clamped to, so no
-    ///      downstream FHE multiply wraps uint64. Two bounds, whichever binds:
-    ///      the price multiply in {_swap} — which reserves 2^shift - 1 of
-    ///      headroom for the ceil-rounding add that follows it — and the fee
-    ///      multiply in {_takeFee}. At MAX_SWAP_FEE_Q20 the fee bound is ~1.76e15,
-    ///      while a PRICE_BITS-wide mantissa keeps the price bound under 2^49, so
-    ///      the fee bound only binds for a rate small enough to clamp at shift 63.
+    /// @dev The plaintext ceiling a fill's input amount is clamped to, so the
+    ///      price multiply in {_swap} cannot wrap uint64; it reserves
+    ///      2^shift - 1 of headroom for the ceil-rounding add that follows.
+    ///      {createOrder} keeps it within the {_takeFee} bound too.
+    ///
+    ///      It counts raw INPUT units: under 2^49 whenever shift > 0, which is
+    ///      ~$281M of fUSD but only a few $k of a $0.00001 token, so cheap
+    ///      inputs fill in many pieces. At shift 63 a fill at the cap outputs
+    ///      just under one raw unit.
     /// @param  price The order's price mantissa.
     /// @param  shift The order's priceShift.
     /// @return cap   The maximum input amount safe to process.
-    function _fillCap(uint64 price, uint8 shift) internal view returns (uint64 cap) {
+    function _fillCap(uint64 price, uint8 shift) internal pure returns (uint64 cap) {
         cap = (type(uint64).max - ((uint64(1) << shift) - 1)) / price;
-        uint64 feeQ20 = swapFeeQ20;
-        if (feeQ20 > 1) {
-            uint64 feeCap = type(uint64).max / feeQ20;
-            if (feeCap < cap) cap = feeCap;
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

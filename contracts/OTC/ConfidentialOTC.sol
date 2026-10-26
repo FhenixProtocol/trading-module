@@ -1082,10 +1082,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///         {_takeFee}. The encrypted mirror is re-derived here — once per
     ///         change rather than once per fill.
     ///
-    ///         Applies immediately to every subsequent fill, including fills of
-    ///         orders created under an older rate. That is safe because the fee
-    ///         falls on the taker, who observes the current rate at fill time;
-    ///         a maker-borne fee would instead need a per-order snapshot.
+    ///         Applies immediately to every fill that executes after it,
+    ///         including fills of orders created under an older rate. The fee
+    ///         falls on the taker, so makers need no per-order snapshot.
     ///
     /// @param  feeQ20 The new Q44.20 fee (0 disables; must be ≤ MAX_SWAP_FEE_Q20).
     function setSwapFee(uint64 feeQ20) external onlyOwner {

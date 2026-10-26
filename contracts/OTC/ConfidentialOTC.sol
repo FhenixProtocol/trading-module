@@ -195,7 +195,8 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// accrual (`_feesAccrued`) with no extra confidential transfer. Charging the
 /// output leg instead would force the taker→maker payment through this contract
 /// and add a second transfer to every fill. `eRemaining` still moves by the full
-/// `eRelease`, so no bracket path is affected by fees.
+/// `eRelease`, so no bracket path is affected by fees. The fee rounds down to
+/// whole raw input units (see {_takeFee}).
 ///
 /// The rate is kept in BOTH plaintext (`swapFeeQ20`) and ciphertext
 /// (`_eSwapFeeQ20`). The ciphertext is cached so a fill loads a handle rather
@@ -1611,6 +1612,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      basis-point denominator would need). Because fee ≤ 1 (Q44.20), the
     ///      subtraction can never underflow, and a failed fill has eRelease = 0
     ///      so it accrues nothing without any special casing.
+    ///
+    ///      Rounds down, so a fill below ⌈2^20 / swapFeeQ20⌉ raw input units
+    ///      (100 at the 1% cap) pays no fee, and splitting a trade saves at
+    ///      most one raw input unit per fill. Negligible at 6 decimals, far
+    ///      below an extra fill's gas; for a coarse-decimal input token the fee
+    ///      can be avoided this way. Rounding up instead would charge a whole
+    ///      raw unit on tiny fills, which is worse on exactly those tokens.
     ///
     ///      The `feeQ20 == 0` fast path is why {swapFeeQ20} is mirrored in
     ///      plaintext: you cannot branch on a ciphertext, so with the fee

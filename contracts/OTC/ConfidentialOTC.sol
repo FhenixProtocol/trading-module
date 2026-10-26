@@ -454,6 +454,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      Fees are skimmed from input already sitting in escrow, so the
     ///      tokens are present without any extra transfer. An unset slot is the
     ///      zero handle, which `FHE.add` treats as encrypted zero.
+    ///      Deliberately readable by this contract only: every fill makes a new
+    ///      handle, so granting each one to the owner would let them diff
+    ///      consecutive totals into single-fill fees. Totals surface once per
+    ///      sweep, through {sweepFees}'s `eSwept`.
     mapping(address => euint64) private _feesAccrued;
 
     /// @dev SWEEP_COOLDOWN anchor per token: the last {sweepFees} timestamp,
@@ -717,7 +721,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param  token    The token swept.
     /// @param  to       The treasury address that received them.
     /// @param  eAmount  Encrypted amount actually transferred (readable by the
-    ///                  treasury and this contract).
+    ///                  treasury, the sweeping owner and this contract).
     event FeesSwept(address indexed token, address indexed to, euint64 eAmount);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1121,7 +1125,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///         of fills. It does not stop the owner isolating one fill (by
     ///         toggling the fee, pausing or delisting); the owner is trusted.
     /// @param  token      The token to sweep.
-    /// @return eSwept The encrypted amount actually transferred.
+    /// @return eSwept The encrypted amount actually transferred, decryptable by
+    ///                the treasury and by the caller, so the owner can verify a
+    ///                sweep (including one a token clamped to 0) without the
+    ///                treasury key. Privacy-neutral: the owner could already
+    ///                point {treasury} at its own key.
     function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eSwept) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
@@ -1139,6 +1147,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         FHE.allowThis(eSwept);
         FHE.allow(eSwept, to);
+        FHE.allow(eSwept, msg.sender);
 
         emit FeesSwept(token, to, eSwept);
     }

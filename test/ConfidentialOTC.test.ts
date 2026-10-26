@@ -3091,6 +3091,28 @@ describe("ConfidentialOTC", () => {
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
+    it("lets the sweeping owner decrypt the swept amount without the treasury key", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Treasury is a separate key, as a cold wallet or multisig would be.
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
+      const receipt = await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
+      const swept = receipt!.logs
+        .map(l => otc.interface.parseLog(l))
+        .find(e => e?.name === "FeesSwept")!.args.eAmount;
+
+      const acl = await hre.cofhe.mocks.getMockACL();
+      expect(await acl.isAllowed(swept, deployer.address)).to.equal(true);
+      expect(await acl.isAllowed(swept, carol.address)).to.equal(true);
+      expect(await acl.isAllowed(swept, bob.address)).to.equal(false);
+      await hre.cofhe.mocks.expectPlaintext(swept, feeOf(mBTC, FEE_030));
+    });
+
     it("throttles sweeps to once per SWEEP_COOLDOWN, defeating the sandwich", async () => {
       const { deployer, bob, ecbtc, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
 

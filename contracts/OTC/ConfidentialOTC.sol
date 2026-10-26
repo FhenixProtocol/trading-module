@@ -205,9 +205,8 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// the zero-fee fast path — you cannot branch on a ciphertext.
 ///
 /// Accrued fees are swept by the owner via `sweepFees(token)` to `treasury`,
-/// at most once per SWEEP_COOLDOWN (23h) per token. A sweep discloses its own
-/// size to the treasury, so throttling it stops the owner from bracketing a
-/// single fill to back out that taker's exact amount from the public fee rate.
+/// at most once per SWEEP_COOLDOWN (23h) per token, the first sweep counted
+/// from the token's first fee. See {sweepFees}.
 ///
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -452,8 +451,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      zero handle, which `FHE.add` treats as encrypted zero.
     mapping(address => euint64) private _feesAccrued;
 
-    /// @dev Last {sweepFees} timestamp per token, enforcing SWEEP_COOLDOWN.
-    ///      0 means never swept, which never blocks the first sweep.
+    /// @dev SWEEP_COOLDOWN anchor per token: the last {sweepFees} timestamp,
+    ///      or the token's first fee if it has never been swept. 0 means no
+    ///      fee has accrued yet.
     mapping(address => uint64) private _lastSweepAt;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1103,22 +1103,18 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///         `token` is the sum of open orders' `eRemaining` plus accrued
     ///         fees, and each fee was carved out of input that had already been
     ///         debited from an order's `eRemaining`.
-    ///         Rate-limited to once per SWEEP_COOLDOWN per token. A sweep
-    ///         always discloses its own size — the treasury can decrypt its own
-    ///         balance whatever ACL is set here — so an unthrottled sweep would
-    ///         let the owner bracket a single fill (sweep, wait for one fill,
-    ///         sweep) and read its fee. The rate is public, so that recovers
-    ///         the taker's exact amount. The cooldown forces each disclosed
-    ///         total to aggregate a day of fills. It is a hard constant, not a
-    ///         governable one, since the owner is the party it constrains.
+    ///         Rate-limited to once per SWEEP_COOLDOWN per token, the first
+    ///         sweep counted from the token's first fee. A sweep discloses its
+    ///         total to the treasury, so the cooldown makes it aggregate a day
+    ///         of fills. It does not stop the owner isolating one fill (by
+    ///         toggling the fee, pausing or delisting); the owner is trusted.
     /// @param  token      The token to sweep.
     /// @return eSwept The encrypted amount actually transferred.
     function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eSwept) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
 
-        uint64 last = _lastSweepAt[token];
-        if (last != 0 && block.timestamp < last + SWEEP_COOLDOWN) revert SweepTooSoon();
+        if (block.timestamp < _lastSweepAt[token] + SWEEP_COOLDOWN) revert SweepTooSoon();
 
         _feesAccrued[token] = euint64.wrap(0);
         _lastSweepAt[token] = uint64(block.timestamp);
@@ -1135,16 +1131,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         emit FeesSwept(token, to, eSwept);
     }
 
-    /// @notice Timestamp of the last fee sweep for a token (0 if never swept).
+    /// @notice The token's sweep-cooldown anchor: its last fee sweep, or its
+    ///         first fee if it has never been swept (0 if no fee has accrued).
     /// @param  token The token to query.
-    /// @return The last sweep timestamp.
+    /// @return The cooldown anchor timestamp.
     function lastSweepAt(address token) external view returns (uint64) {
         return _lastSweepAt[token];
     }
 
     /// @notice Earliest timestamp at which `token` may next be swept.
     /// @param  token The token to query.
-    /// @return The unlock timestamp (0 when the token has never been swept).
+    /// @return The unlock timestamp (0 when no fee has accrued yet).
     function sweepUnlockAt(address token) external view returns (uint64) {
         uint64 last = _lastSweepAt[token];
         return last == 0 ? 0 : last + SWEEP_COOLDOWN;
@@ -1622,6 +1619,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         euint64 accrued = FHE.add(_feesAccrued[token], eFee);
         FHE.allowThis(accrued);
         _feesAccrued[token] = accrued;
+
+        if (_lastSweepAt[token] == 0) _lastSweepAt[token] = uint64(block.timestamp);
 
         eToTaker = FHE.sub(eRelease, eFee);
         FHE.allowThis(eToTaker);

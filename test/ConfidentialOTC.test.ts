@@ -3074,6 +3074,7 @@ describe("ConfidentialOTC", () => {
       const carol = (await ethers.getSigners())[3];
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
 
       await expectBalance(ecbtc, carol.address, fee);
@@ -3089,11 +3090,22 @@ describe("ConfidentialOTC", () => {
       const cooldown = await otc.SWEEP_COOLDOWN();
       expect(cooldown).to.equal(82_800n); // 23h
 
-      // First sweep is never blocked — no prior collection to wait on.
+      // No fee yet, so no cooldown anchor.
       expect(await otc.lastSweepAt(ecbtcAddr)).to.equal(0n);
       expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(0n);
 
+      // The first fee anchors the cooldown, so the first sweep cannot isolate
+      // the first fill either.
       await fillAndPublish(otc, bob, bobClient, id, 400n);
+      const firstFee = await otc.lastSweepAt(ecbtcAddr);
+      expect(firstFee).to.be.greaterThan(0n);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(firstFee + cooldown);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [Number(firstFee + cooldown) - 1]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [Number(firstFee + cooldown)]);
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
 
       const last = await otc.lastSweepAt(ecbtcAddr);
@@ -3125,6 +3137,7 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
       await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
       await expectBalance(ecbtc, carol.address, fee1);
 

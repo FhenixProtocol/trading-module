@@ -1125,8 +1125,8 @@ describe("ConfidentialOTC", () => {
         [1n << 79n, 1n << 15n, 0n], // rate 2^15: the first rate kept whole
         [(1n << 79n) - 1n, 1n << 16n, 1n], // just under: 65,535.99… rounds up to 2^16
         [X64, 1n << 15n, 15n], // $1.00 → 32,768 / 2^15
-        [3n, 2n, 63n], // rate 3 / 2^64: clamped at shift 63, 1.5 rounds up to 2
-        [1n, 1n, 63n],
+        [(1n << 16n) - 1n, 1n << 15n, 63n], // just under 2^-48: clamped at shift 63, rounds up
+        [10_485n, 5_243n, 63n], // the lowest rate PriceTooLow accepts
       ];
       for (const [priceX64, price, shift] of cases) {
         const id = await createOrder(
@@ -1154,7 +1154,7 @@ describe("ConfidentialOTC", () => {
         [1n << 16n, 1n << 15n], // rate 2^-48: the last full 16-bit mantissa, exact
         [(1n << 16n) + 1n, (1n << 15n) + 1n], // odd: +1 step = +0.15 bp
         [21_961n, 10_981n], // a 0-decimal BTC for a $0.0001 token, see below: +0.46 bp
-        [3n, 2n], // +1 step = +33%, but a rate of 1.6e-19 is not a real market
+        [10_485n, 5_243n], // the lowest rate PriceTooLow accepts: +1 step = +0.95 bp
       ];
       for (const [priceX64, price] of cases) {
         const id = await createOrder(
@@ -1240,23 +1240,22 @@ describe("ConfidentialOTC", () => {
       await expectBalance(b, alice.address, U64_MAX);
       await expectBalance(b, bob.address, 0n);
 
-      // Shift 63, mask 2^63 − 1: priceX64 = 1 stores 1 / 2^63, so _fillCap is
-      // 2^63 and 2^63 × 1 + (2^63 − 1) = 2^64 − 1. The output is 1 raw unit.
-      // At the maker's quote of 2^-64 that unit would buy 2^64 raw, so the
-      // stored rate is twice the quote.
+      // Shift 63, mask 2^63 − 1: priceX64 = 2^14 stores 2^13 / 2^63, so
+      // _fillCap is 2^50 and 2^50 × 2^13 + (2^63 − 1) = 2^64 − 1. The output
+      // is 1 raw unit.
       const id63 = await createAndActivate(
         otc,
         alice,
         aliceClient,
         aAddr,
         fusdAddr,
-        1n,
+        1n << 14n,
         0n,
         ...(await enc(aliceClient, HALF, otc)),
       );
-      await expectStored(otc, id63, 1n, 63n);
+      await expectStored(otc, id63, 1n << 13n, 63n);
       await fill(otc, bob, bobClient, id63, U64_MAX);
-      await expectBalance(a, bob.address, HALF + 1n);
+      await expectBalance(a, bob.address, (1n << 50n) + 1n);
       await expectBalance(fusd, alice.address, 1n);
       await expectBalance(fusd, bob.address, 0n);
     });
@@ -2835,16 +2834,9 @@ describe("ConfidentialOTC", () => {
     /// Mirrors the contract's Q44.20 skim: eRelease × feeQ20 >> 20.
     const feeOf = (amount: bigint, feeQ20: bigint) => (amount * feeQ20) >> 20n;
 
-    /// Mirrors _fillCap: the tighter of the price and fee overflow bounds. The
-    /// price bound reserves 2^shift − 1 of headroom for the ceil-rounding add in _swap.
-    const fillCap = (price: bigint, shift: bigint, feeQ20: bigint) => {
-      let cap = (MAXU64 - ((1n << shift) - 1n)) / price;
-      if (feeQ20 > 1n) {
-        const feeCap = MAXU64 / feeQ20;
-        if (feeCap < cap) cap = feeCap;
-      }
-      return cap;
-    };
+    /// Mirrors _fillCap: the price overflow bound, reserving 2^shift − 1 of
+    /// headroom for the ceil-rounding add in _swap.
+    const fillCap = (price: bigint, shift: bigint) => (MAXU64 - ((1n << shift) - 1n)) / price;
 
     /// Maker alice posts 1 mBTC of ecBTC for fUSD; bob funded to take it.
     async function withOrder(feeQ20: bigint) {
@@ -2959,19 +2951,34 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, otcAddr, mBTC); // escrow intact, nothing skimmed
     });
 
-    it("clamps the fill so eRelease × fee cannot wrap uint64", async () => {
-      // A PRICE_BITS-wide mantissa keeps the price bound under 2^49, below the
-      // fee bound (~1.76e15) — except for a rate small enough to clamp at shift
-      // 63. priceX64 = 200 stores as 100 / 2^63: its price-only cap is 9.2e16,
-      // and 9.2e16 × 10486 overflows uint64 — the fee bound is what prevents it.
+    it("rejects a rate whose fill cap the fee multiply would overflow, even at fee 0", async () => {
+      // priceX64 = 200 stores as 100 / 2^63: its cap is 9.2e16 raw, and
+      // 9.2e16 × MAX_FEE wraps uint64. A fee cap would cut each fill to 1.76e15
+      // raw (0.019 raw output) while still charging a whole raw unit, so the
+      // order is refused up front — at the maximum fee, not the live one.
+      const { alice, otc, aliceClient, fusdAddr, ecbtcAddr } = await setup();
+      expect(await otc.swapFeeQ20()).to.equal(0n);
+
+      for (const priceX64 of [200n, 10_484n]) {
+        // 10,484 → 5,242 / 2^63: one mantissa step below the lowest accepted rate.
+        await expect(
+          otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, priceX64, 0n, ...(await enc(aliceClient, mBTC, otc))),
+        ).to.be.revertedWithCustomError(otc, "PriceTooLow");
+      }
+    });
+
+    it("keeps eRelease × fee within uint64 at MAX_SWAP_FEE_Q20 for the lowest accepted rate", async () => {
+      // priceX64 = 10,485 stores as 5,243 / 2^63, the smallest mantissa whose
+      // price cap (1.759e15) still fits the fee bound: cap × MAX_FEE ≤ 2^64 − 1,
+      // and a full fill at the cap outputs just under one raw unit.
       const ctx = await setup();
       const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
 
-      const [price, shift] = [100n, 63n];
+      const [price, shift] = [5_243n, 63n];
       await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
 
-      const cap = fillCap(price, shift, MAX_FEE);
-      expect(cap).to.be.lessThan((MAXU64 - ((1n << shift) - 1n)) / price); // fee bound binds
+      const cap = fillCap(price, shift);
+      expect(cap * MAX_FEE).to.be.lessThanOrEqual(MAXU64);
       const deposit = cap + 10n ** 12n; // more than the cap, so it must clamp
       const output = (cap * price + (1n << shift) - 1n) >> shift; // taker pays the ceiling
 
@@ -2986,7 +2993,7 @@ describe("ConfidentialOTC", () => {
         aliceClient,
         ecbtcAddr,
         fusdAddr,
-        200n, // priceX64 → 100 / 2^63
+        10_485n, // priceX64 → 5,243 / 2^63
         0n,
         ...(await enc(aliceClient, deposit, otc)),
       );
@@ -2995,7 +3002,7 @@ describe("ConfidentialOTC", () => {
 
       await fill(otc, bob, bobClient, id, deposit); // request everything
 
-      // eActual clamped to the fee bound; the fee is a sane ~1%, not a wrapped
+      // eActual clamped to the cap; the fee is a sane ~1%, not a wrapped
       // value, and the taker's receipt plus the retained fee reconstruct it.
       const fee = feeOf(cap, MAX_FEE);
       expect(fee).to.be.greaterThan(0n);
@@ -3059,7 +3066,7 @@ describe("ConfidentialOTC", () => {
 
     // ── collection ────────────────────────────────────────────────────────
 
-    it("sweeps accrued fees to the treasury and cannot double-sweep", async () => {
+    it("sweeps accrued fees to the treasury, and a repeat sweep moves nothing", async () => {
       const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
 
       // Nothing accrued yet.
@@ -3074,13 +3081,66 @@ describe("ConfidentialOTC", () => {
       const carol = (await ethers.getSigners())[3];
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
 
       await expectBalance(ecbtc, carol.address, fee);
       await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
-      // The slot is reset to the zero handle, so the guard fires again — this
-      // is what would break if it were cleared with FHE.asEuint64(0).
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+
+      // The slot now holds the encrypted leftover (0), not the zero handle, so
+      // a repeat sweep passes the guard, waits out the cooldown, and moves 0.
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n);
+    });
+
+    it("keeps fees a clamped sweep did not move, so a later sweep collects them", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee = feeOf(mBTC, FEE_030);
+      await fillAndPublish(otc, bob, bobClient, id, mBTC); // the contract now holds only the fee
+
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+      const cooldown = Number(await otc.SWEEP_COOLDOWN());
+
+      // Make the transfer fail without reverting: with the balance gone, the
+      // all-or-nothing confidentialTransfer moves 0, as a blocked recipient would.
+      await (await ecbtc.burn(otcAddr, fee)).wait();
+      await hre.network.provider.send("evm_increaseTime", [cooldown]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, 0n);
+
+      // The transfer can succeed again; the next sweep collects the full fee.
+      await (await ecbtc.mint(otcAddr, fee)).wait();
+      await hre.network.provider.send("evm_increaseTime", [cooldown]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n);
+    });
+
+    it("lets the sweeping owner decrypt the swept amount without the treasury key", async () => {
+      const { deployer, bob, otc, bobClient, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      await fillAndPublish(otc, bob, bobClient, id, mBTC);
+
+      // Treasury is a separate key, as a cold wallet or multisig would be.
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
+      const receipt = await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
+      const swept = receipt!.logs
+        .map(l => otc.interface.parseLog(l))
+        .find(e => e?.name === "FeesSwept")!.args.eAmount;
+
+      const acl = await hre.cofhe.mocks.getMockACL();
+      expect(await acl.isAllowed(swept, deployer.address)).to.equal(true);
+      expect(await acl.isAllowed(swept, carol.address)).to.equal(true);
+      expect(await acl.isAllowed(swept, bob.address)).to.equal(false);
+      await hre.cofhe.mocks.expectPlaintext(swept, feeOf(mBTC, FEE_030));
     });
 
     it("throttles sweeps to once per SWEEP_COOLDOWN, defeating the sandwich", async () => {
@@ -3089,11 +3149,22 @@ describe("ConfidentialOTC", () => {
       const cooldown = await otc.SWEEP_COOLDOWN();
       expect(cooldown).to.equal(82_800n); // 23h
 
-      // First sweep is never blocked — no prior collection to wait on.
+      // No fee yet, so no cooldown anchor.
       expect(await otc.lastSweepAt(ecbtcAddr)).to.equal(0n);
       expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(0n);
 
+      // The first fee anchors the cooldown, so the first sweep cannot isolate
+      // the first fill either.
       await fillAndPublish(otc, bob, bobClient, id, 400n);
+      const firstFee = await otc.lastSweepAt(ecbtcAddr);
+      expect(firstFee).to.be.greaterThan(0n);
+      expect(await otc.sweepUnlockAt(ecbtcAddr)).to.equal(firstFee + cooldown);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [Number(firstFee + cooldown) - 1]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [Number(firstFee + cooldown)]);
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
 
       const last = await otc.lastSweepAt(ecbtcAddr);
@@ -3125,6 +3196,7 @@ describe("ConfidentialOTC", () => {
       await (await otc.connect(deployer).setTreasury(carol.address)).wait();
 
       await fillAndPublish(otc, bob, bobClient, id, 400n);
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
       await (await otc.connect(deployer).sweepFees(ecbtcAddr)).wait();
       await expectBalance(ecbtc, carol.address, fee1);
 

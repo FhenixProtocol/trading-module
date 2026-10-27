@@ -195,19 +195,19 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// accrual (`_feesAccrued`) with no extra confidential transfer. Charging the
 /// output leg instead would force the taker→maker payment through this contract
 /// and add a second transfer to every fill. `eRemaining` still moves by the full
-/// `eRelease`, so no bracket path is affected by fees.
+/// `eRelease`, so no bracket path is affected by fees. The fee rounds down to
+/// whole raw input units (see {_takeFee}).
 ///
 /// The rate is kept in BOTH plaintext (`swapFeeQ20`) and ciphertext
 /// (`_eSwapFeeQ20`). The ciphertext is cached so a fill loads a handle rather
 /// than paying for a fresh trivial encryption, and is `allowPublic`'d so anyone
 /// may read the live fee. The plaintext mirror is not redundant: the fee is
-/// public policy, and it is the only way to derive the overflow cap and to take
-/// the zero-fee fast path — you cannot branch on a ciphertext.
+/// public policy, and it is the only way to take the zero-fee fast path — you
+/// cannot branch on a ciphertext.
 ///
 /// Accrued fees are swept by the owner via `sweepFees(token)` to `treasury`,
-/// at most once per SWEEP_COOLDOWN (23h) per token. A sweep discloses its own
-/// size to the treasury, so throttling it stops the owner from bracketing a
-/// single fill to back out that taker's exact amount from the public fee rate.
+/// at most once per SWEEP_COOLDOWN (23h) per token, the first sweep counted
+/// from the token's first fee. See {sweepFees}.
 ///
 /// ──────────────────────────────────────────────────────────────────────────
 ///
@@ -215,6 +215,11 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// `eOutput`, the payment moves 0 and `eOutputPaid != eOutput`, so `eRelease`
 /// is 0 and the escrow is untouched. This prevents a taker from draining input
 /// without paying. Takers must size their request to what they can afford.
+///
+/// A request above `eRemaining` (visible only to the maker) is clamped, and
+/// the payment is rounded up, so a clamped fill can cost up to one raw output
+/// unit more than the input it releases is worth. Negligible at 6 decimals,
+/// but a whole coin when the output token has 0 decimals.
 ///
 /// Taker must have set the OTC as operator on their outputToken before calling
 /// fillOrder, and must call `publishBracket` afterward (within the grace window)
@@ -271,7 +276,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      Realistic OTC taker fees sit at 0.05–0.30%, so this leaves ample
     ///      headroom while bounding how far governance can move the fee against
     ///      takers. It also keeps the `eRelease × fee` overflow bound (see
-    ///      {_fillCap}) around 1.76e15 raw units (~$1.76bn at 6 decimals).
+    ///      {_fillCap}) around 1.76e15 raw input units per fill (~$1.76bn of
+    ///      a $1, 6-decimal token; far less for a cheap one).
     uint64 public constant MAX_SWAP_FEE_Q20 = 10_486;
 
     /// @dev Minimum interval between fee sweeps of the same token. Deliberately
@@ -430,11 +436,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Protocol swap fee, Q44.20 (fraction of the released input skimmed
     ///         from the taker). 0 = disabled, which is the deployed default.
     /// @dev    Deliberately plaintext: the fee is public policy, and a plaintext
-    ///         mirror buys two things an `euint64` cannot. It lets {_fillCap}
-    ///         derive the overflow bound without a decryption, and it lets
-    ///         {_takeFee} branch — you cannot branch on an encrypted value, so
-    ///         without this mirror a zero fee would still pay for the full FHE
-    ///         mul/shr/sub/add on every fill.
+    ///         mirror lets {_takeFee} branch — you cannot branch on an
+    ///         encrypted value, so without it a zero fee would still pay for
+    ///         the full FHE mul/shr/sub/add on every fill.
     uint64 public swapFeeQ20;
 
     /// @dev Encrypted mirror of {swapFeeQ20}, cached so each fill loads a handle
@@ -450,10 +454,15 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      Fees are skimmed from input already sitting in escrow, so the
     ///      tokens are present without any extra transfer. An unset slot is the
     ///      zero handle, which `FHE.add` treats as encrypted zero.
+    ///      Deliberately readable by this contract only: every fill makes a new
+    ///      handle, so granting each one to the owner would let them diff
+    ///      consecutive totals into single-fill fees. Totals surface once per
+    ///      sweep, through {sweepFees}'s `eSwept`.
     mapping(address => euint64) private _feesAccrued;
 
-    /// @dev Last {sweepFees} timestamp per token, enforcing SWEEP_COOLDOWN.
-    ///      0 means never swept, which never blocks the first sweep.
+    /// @dev SWEEP_COOLDOWN anchor per token: the last {sweepFees} timestamp,
+    ///      or the token's first fee if it has never been swept. 0 means no
+    ///      fee has accrued yet.
     mapping(address => uint64) private _lastSweepAt;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -712,7 +721,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param  token    The token swept.
     /// @param  to       The treasury address that received them.
     /// @param  eAmount  Encrypted amount actually transferred (readable by the
-    ///                  treasury and this contract).
+    ///                  treasury, the sweeping owner and this contract).
     event FeesSwept(address indexed token, address indexed to, euint64 eAmount);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -725,6 +734,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     error SameLeg();
     /// @notice A price or oracle price was zero / below MIN_ORACLE_PRICE.
     error ZeroPrice();
+    /// @notice The rate is so low that, at MAX_SWAP_FEE_Q20, a fill would be
+    ///         capped below one raw output unit but still pay a whole one.
+    error PriceTooLow();
     /// @notice A token's confidential-ledger decimals are incompatible (fUSD != 6, or token > 6).
     error InvalidDecimals();
     /// @notice The supplied expiry is already in the past.
@@ -832,6 +844,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Whitelist a token, enabling it as an input or output leg.
     /// @dev    Enforces MAX_TOKEN_DECIMALS on the token's confidential ledger (see
     ///         {_confidentialDecimals}) so createOrder never needs to re-check.
+    ///
+    ///         Prefer tokens with exactly 6 confidential decimals, and list
+    ///         fewer only rarely, after weighing the raw unit's value. A
+    ///         clamped fill can overpay by up to one raw output unit.
     /// @param  token        The token to whitelist.
     /// @param  initialPrice The token's initial Q44.20 oracle price (≥ MIN_ORACLE_PRICE).
     function whitelistToken(address token, uint64 initialPrice) external onlyOwner {
@@ -1066,10 +1082,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///         {_takeFee}. The encrypted mirror is re-derived here — once per
     ///         change rather than once per fill.
     ///
-    ///         Applies immediately to every subsequent fill, including fills of
-    ///         orders created under an older rate. That is safe because the fee
-    ///         falls on the taker, who observes the current rate at fill time;
-    ///         a maker-borne fee would instead need a per-order snapshot.
+    ///         Applies immediately to every fill that executes after it,
+    ///         including fills of orders created under an older rate. The fee
+    ///         falls on the taker, so makers need no per-order snapshot.
     ///
     /// @param  feeQ20 The new Q44.20 fee (0 disables; must be ≤ MAX_SWAP_FEE_Q20).
     function setSwapFee(uint64 feeQ20) external onlyOwner {
@@ -1097,30 +1112,32 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Sweep all fees accrued in `token` to the {treasury}. Owner only.
     ///
-    /// @dev    Zeroes the accrual before transferring, so fills landing after
-    ///         this call accumulate into a fresh balance that a later sweep
-    ///         collects. Never touches live escrow: the contract's balance of
+    /// @dev    Leaves in the accrual whatever the transfer did not move, so a
+    ///         sweep the token clamped (e.g. a blocked treasury) is retried by a
+    ///         later one instead of stranding the fees, as {claimEscrow} does
+    ///         for escrow. After a full sweep the slot holds an encrypted 0, so
+    ///         {NoFeesAccrued} only guards a token that never accrued; a later
+    ///         sweep of nothing just moves 0. Never touches live escrow: the contract's balance of
     ///         `token` is the sum of open orders' `eRemaining` plus accrued
     ///         fees, and each fee was carved out of input that had already been
     ///         debited from an order's `eRemaining`.
-    ///         Rate-limited to once per SWEEP_COOLDOWN per token. A sweep
-    ///         always discloses its own size — the treasury can decrypt its own
-    ///         balance whatever ACL is set here — so an unthrottled sweep would
-    ///         let the owner bracket a single fill (sweep, wait for one fill,
-    ///         sweep) and read its fee. The rate is public, so that recovers
-    ///         the taker's exact amount. The cooldown forces each disclosed
-    ///         total to aggregate a day of fills. It is a hard constant, not a
-    ///         governable one, since the owner is the party it constrains.
+    ///         Rate-limited to once per SWEEP_COOLDOWN per token, the first
+    ///         sweep counted from the token's first fee. A sweep discloses its
+    ///         total to the treasury, so the cooldown makes it aggregate a day
+    ///         of fills. It does not stop the owner isolating one fill (by
+    ///         toggling the fee, pausing or delisting); the owner is trusted.
     /// @param  token      The token to sweep.
-    /// @return eSwept The encrypted amount actually transferred.
+    /// @return eSwept The encrypted amount actually transferred, decryptable by
+    ///                the treasury and by the caller, so the owner can verify a
+    ///                sweep (including one a token clamped to 0) without the
+    ///                treasury key. Privacy-neutral: the owner could already
+    ///                point {treasury} at its own key.
     function sweepFees(address token) external onlyOwner nonReentrant returns (euint64 eSwept) {
         euint64 accrued = _feesAccrued[token];
         if (euint64.unwrap(accrued) == 0) revert NoFeesAccrued();
 
-        uint64 last = _lastSweepAt[token];
-        if (last != 0 && block.timestamp < last + SWEEP_COOLDOWN) revert SweepTooSoon();
+        if (block.timestamp < _lastSweepAt[token] + SWEEP_COOLDOWN) revert SweepTooSoon();
 
-        _feesAccrued[token] = euint64.wrap(0);
         _lastSweepAt[token] = uint64(block.timestamp);
 
         address to = treasury;
@@ -1129,22 +1146,28 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             token
         );
 
+        euint64 left = FHE.sub(accrued, eSwept);
+        FHE.allowThis(left);
+        _feesAccrued[token] = left;
+
         FHE.allowThis(eSwept);
         FHE.allow(eSwept, to);
+        FHE.allow(eSwept, msg.sender);
 
         emit FeesSwept(token, to, eSwept);
     }
 
-    /// @notice Timestamp of the last fee sweep for a token (0 if never swept).
+    /// @notice The token's sweep-cooldown anchor: its last fee sweep, or its
+    ///         first fee if it has never been swept (0 if no fee has accrued).
     /// @param  token The token to query.
-    /// @return The last sweep timestamp.
+    /// @return The cooldown anchor timestamp.
     function lastSweepAt(address token) external view returns (uint64) {
         return _lastSweepAt[token];
     }
 
     /// @notice Earliest timestamp at which `token` may next be swept.
     /// @param  token The token to query.
-    /// @return The unlock timestamp (0 when the token has never been swept).
+    /// @return The unlock timestamp (0 when no fee has accrued yet).
     function sweepUnlockAt(address token) external view returns (uint64) {
         uint64 last = _lastSweepAt[token];
         return last == 0 ? 0 : last + SWEEP_COOLDOWN;
@@ -1249,8 +1272,11 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param outputToken Whitelisted FHERC20 the maker wants in return.
     /// @param priceX64    Q64.64 rate: raw output per raw input, scaled by 2^64.
     ///                    Stored rounded up to a PRICE_BITS-bit mantissa (see
-    ///                    {_normalizePrice}).
-    /// @param expiry      Unix timestamp after which the order can no longer be
+    ///                    {_normalizePrice}). Rejected if the fee multiply at
+    ///                    MAX_SWAP_FEE_Q20 would need a smaller cap than
+    ///                    {_fillCap}: such a fill buys less than one raw output
+    ///                    unit yet pays a whole one.
+    /// @param expiry     Unix timestamp after which the order can no longer be
     ///                    filled. Pass 0 for good-til-cancelled.
     /// @param encAmount   Encrypted input amount handle, signed for this contract.
     /// @param inputProof  Batch signature covering `encAmount`, bound to this contract.
@@ -1267,6 +1293,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         if (address(inputToken) == address(outputToken)) revert SameLeg();
         _requireWhitelisted(address(inputToken), address(outputToken));
         if (priceX64 == 0) revert ZeroPrice();
+        (uint64 price, uint8 shift) = _normalizePrice(priceX64);
+        if (_fillCap(price, shift) > type(uint64).max / MAX_SWAP_FEE_Q20) revert PriceTooLow();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
         // Maker bond (optional anti-spam lever; usually 0).
@@ -1296,8 +1324,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         o.outputToken = outputToken;
         o.eRemaining = actual;
         o.eDepositedAmount = actual; // same handle; ACL already granted above
-        (o.price, o.priceShift) = _normalizePrice(priceX64);
-        _cacheShift(o.priceShift);
+        o.price = price;
+        o.priceShift = shift;
+        _cacheShift(shift);
         o.expiry = expiry;
         o.bracket = BRACKET_UNPUBLISHED;
         o.latestSeq = CREATE_SEQ;
@@ -1467,7 +1496,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///
     /// @dev    Taker must have called `outputToken.setOperator(address(this), …)`
     ///         before calling this function. Send at least `ethBondSize()` wei;
-    ///         any excess is refunded.
+    ///         any excess is refunded. A request above the remaining size is
+    ///         clamped and may overpay by up to one raw output unit.
     ///
     /// @param orderId         The order to fill against.
     /// @param encTokensWanted Encrypted amount of inputToken the taker wants.
@@ -1597,6 +1627,13 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      subtraction can never underflow, and a failed fill has eRelease = 0
     ///      so it accrues nothing without any special casing.
     ///
+    ///      Rounds down, so a fill below ⌈2^20 / swapFeeQ20⌉ raw input units
+    ///      (100 at the 1% cap) pays no fee, and splitting a trade saves at
+    ///      most one raw input unit per fill. Negligible at 6 decimals, far
+    ///      below an extra fill's gas; for a coarse-decimal input token the fee
+    ///      can be avoided this way. Rounding up instead would charge a whole
+    ///      raw unit on tiny fills, which is worse on exactly those tokens.
+    ///
     ///      The `feeQ20 == 0` fast path is why {swapFeeQ20} is mirrored in
     ///      plaintext: you cannot branch on a ciphertext, so with the fee
     ///      disabled every fill would otherwise still pay for four FHE ops.
@@ -1605,9 +1642,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      below is mod 2^64, so a larger release wraps and silently accrues
     ///      less than the configured rate — no revert, and the books stay
     ///      self-consistent, so nothing surfaces the shortfall. {_swap}
-    ///      guarantees this by clamping the fill through {_fillCap}, whose fee
-    ///      bound is exactly this limit; the clamp is applied to the fill size
-    ///      rather than here so the fee stays exact instead of truncated. Any
+    ///      guarantees this by clamping the fill through {_fillCap}, which
+    ///      {createOrder} keeps within `type(uint64).max / MAX_SWAP_FEE_Q20`
+    ///      for every order, so it holds at any fee the owner can set. Any
     ///      new caller must clamp equivalently — do not rely on this one.
     /// @param  token     The input token the fee is denominated in.
     /// @param  eRelease  The encrypted input released by the fill.
@@ -1623,27 +1660,26 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         FHE.allowThis(accrued);
         _feesAccrued[token] = accrued;
 
+        if (_lastSweepAt[token] == 0) _lastSweepAt[token] = uint64(block.timestamp);
+
         eToTaker = FHE.sub(eRelease, eFee);
         FHE.allowThis(eToTaker);
     }
 
-    /// @dev The plaintext ceiling a fill's input amount is clamped to, so no
-    ///      downstream FHE multiply wraps uint64. Two bounds, whichever binds:
-    ///      the price multiply in {_swap} — which reserves 2^shift - 1 of
-    ///      headroom for the ceil-rounding add that follows it — and the fee
-    ///      multiply in {_takeFee}. At MAX_SWAP_FEE_Q20 the fee bound is ~1.76e15,
-    ///      while a PRICE_BITS-wide mantissa keeps the price bound under 2^49, so
-    ///      the fee bound only binds for a rate small enough to clamp at shift 63.
+    /// @dev The plaintext ceiling a fill's input amount is clamped to, so the
+    ///      price multiply in {_swap} cannot wrap uint64; it reserves
+    ///      2^shift - 1 of headroom for the ceil-rounding add that follows.
+    ///      {createOrder} keeps it within the {_takeFee} bound too.
+    ///
+    ///      It counts raw INPUT units: under 2^49 whenever shift > 0, which is
+    ///      ~$281M of fUSD but only a few $k of a $0.00001 token, so cheap
+    ///      inputs fill in many pieces. At shift 63 a fill at the cap outputs
+    ///      just under one raw unit.
     /// @param  price The order's price mantissa.
     /// @param  shift The order's priceShift.
     /// @return cap   The maximum input amount safe to process.
-    function _fillCap(uint64 price, uint8 shift) internal view returns (uint64 cap) {
+    function _fillCap(uint64 price, uint8 shift) internal pure returns (uint64 cap) {
         cap = (type(uint64).max - ((uint64(1) << shift) - 1)) / price;
-        uint64 feeQ20 = swapFeeQ20;
-        if (feeQ20 > 1) {
-            uint64 feeCap = type(uint64).max / feeQ20;
-            if (feeCap < cap) cap = feeCap;
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

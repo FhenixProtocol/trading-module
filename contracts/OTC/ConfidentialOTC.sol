@@ -1112,9 +1112,12 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Sweep all fees accrued in `token` to the {treasury}. Owner only.
     ///
-    /// @dev    Zeroes the accrual before transferring, so fills landing after
-    ///         this call accumulate into a fresh balance that a later sweep
-    ///         collects. Never touches live escrow: the contract's balance of
+    /// @dev    Leaves in the accrual whatever the transfer did not move, so a
+    ///         sweep the token clamped (e.g. a blocked treasury) is retried by a
+    ///         later one instead of stranding the fees, as {claimEscrow} does
+    ///         for escrow. After a full sweep the slot holds an encrypted 0, so
+    ///         {NoFeesAccrued} only guards a token that never accrued; a later
+    ///         sweep of nothing just moves 0. Never touches live escrow: the contract's balance of
     ///         `token` is the sum of open orders' `eRemaining` plus accrued
     ///         fees, and each fee was carved out of input that had already been
     ///         debited from an order's `eRemaining`.
@@ -1135,7 +1138,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
         if (block.timestamp < _lastSweepAt[token] + SWEEP_COOLDOWN) revert SweepTooSoon();
 
-        _feesAccrued[token] = euint64.wrap(0);
         _lastSweepAt[token] = uint64(block.timestamp);
 
         address to = treasury;
@@ -1143,6 +1145,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
             IFHERC20(token).confidentialTransfer(to, FHE.shareEuint64(accrued, token)),
             token
         );
+
+        euint64 left = FHE.sub(accrued, eSwept);
+        FHE.allowThis(left);
+        _feesAccrued[token] = left;
 
         FHE.allowThis(eSwept);
         FHE.allow(eSwept, to);

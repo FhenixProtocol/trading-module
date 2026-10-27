@@ -3066,7 +3066,7 @@ describe("ConfidentialOTC", () => {
 
     // ── collection ────────────────────────────────────────────────────────
 
-    it("sweeps accrued fees to the treasury and cannot double-sweep", async () => {
+    it("sweeps accrued fees to the treasury, and a repeat sweep moves nothing", async () => {
       const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
 
       // Nothing accrued yet.
@@ -3086,9 +3086,39 @@ describe("ConfidentialOTC", () => {
 
       await expectBalance(ecbtc, carol.address, fee);
       await expectBalance(ecbtc, otcAddr, 0n); // escrow fully drained
-      // The slot is reset to the zero handle, so the guard fires again — this
-      // is what would break if it were cleared with FHE.asEuint64(0).
-      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
+
+      // The slot now holds the encrypted leftover (0), not the zero handle, so
+      // a repeat sweep passes the guard, waits out the cooldown, and moves 0.
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "SweepTooSoon");
+      await hre.network.provider.send("evm_increaseTime", [Number(await otc.SWEEP_COOLDOWN())]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n);
+    });
+
+    it("keeps fees a clamped sweep did not move, so a later sweep collects them", async () => {
+      const { deployer, bob, ecbtc, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+
+      const fee = feeOf(mBTC, FEE_030);
+      await fillAndPublish(otc, bob, bobClient, id, mBTC); // the contract now holds only the fee
+
+      const carol = (await ethers.getSigners())[3];
+      await (await otc.connect(deployer).setTreasury(carol.address)).wait();
+      const cooldown = Number(await otc.SWEEP_COOLDOWN());
+
+      // Make the transfer fail without reverting: with the balance gone, the
+      // all-or-nothing confidentialTransfer moves 0, as a blocked recipient would.
+      await (await ecbtc.burn(otcAddr, fee)).wait();
+      await hre.network.provider.send("evm_increaseTime", [cooldown]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, 0n);
+
+      // The transfer can succeed again; the next sweep collects the full fee.
+      await (await ecbtc.mint(otcAddr, fee)).wait();
+      await hre.network.provider.send("evm_increaseTime", [cooldown]);
+      await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.emit(otc, "FeesSwept");
+      await expectBalance(ecbtc, carol.address, fee);
+      await expectBalance(ecbtc, otcAddr, 0n);
     });
 
     it("lets the sweeping owner decrypt the swept amount without the treasury key", async () => {

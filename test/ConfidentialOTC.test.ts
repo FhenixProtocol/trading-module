@@ -118,14 +118,12 @@ describe("ConfidentialOTC", () => {
     ])) as unknown as ConfidentialToken;
     await eceth.waitForDeployment();
 
-    const otc = (await ethers.deployContract("ConfidentialOTC", [
-      await fusd.getAddress(),
-      deployer.address,
-    ])) as unknown as ConfidentialOTC;
+    const otc = (await ethers.deployContract("ConfidentialOTC", [deployer.address])) as unknown as ConfidentialOTC;
     await otc.waitForDeployment();
 
-    // Whitelist both test tokens at realistic oracle prices, and set the ETH
-    // price used to size fill bonds. fUSD is auto-whitelisted at Q_DENOM.
+    // Whitelist the test tokens at realistic oracle prices (the stablecoin at
+    // $1 = Q_DENOM), and set the ETH price used to size fill bonds.
+    await (await otc.connect(deployer).whitelistToken(await fusd.getAddress(), Q)).wait();
     await (await otc.connect(deployer).whitelistToken(await ecbtc.getAddress(), ORACLE_ECBTC)).wait();
     await (await otc.connect(deployer).whitelistToken(await eceth.getAddress(), ORACLE_ECETH)).wait();
     await (await otc.connect(deployer).setEthOraclePrice(ORACLE_ECETH)).wait();
@@ -301,68 +299,25 @@ describe("ConfidentialOTC", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("constructor", () => {
-    it("reverts on zero fUSD address", async () => {
-      const [signer] = await ethers.getSigners();
+    it("reverts on zero treasury address", async () => {
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(ethers.ZeroAddress, signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "ZeroAddress",
-      );
+      await expect(factory.deploy(ethers.ZeroAddress)).to.be.revertedWithCustomError(factory, "ZeroAddress");
     });
 
-    it("reverts when fUSD does not use exactly 6 decimals", async () => {
-      const fusd18 = (await ethers.deployContract("FHERC20_Harness", [
-        "fUSD18",
-        "fUSD18",
-        18,
+    it("deploys with an empty whitelist — no token is auto-listed", async () => {
+      const [signer] = await ethers.getSigners();
+      const token = (await ethers.deployContract("FHERC20_Harness", [
+        "Confidential USD",
+        "cUSD",
+        6,
         "",
       ])) as unknown as ConfidentialToken;
-      await fusd18.waitForDeployment();
-
-      const [signer] = await ethers.getSigners();
-      const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd18.getAddress(), signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "InvalidDecimals",
-      );
-    });
-
-    // Dual-ledger fUSD (FUSDJmi shape): the public ledger is always 6 decimals, but the
-    // confidential layer — the only ledger the OTC escrows and settles on — can be coarser.
-    // The bracket thresholds and the $1 auto-price are in 6-decimal confidential units, so a
-    // 4-decimal confidential fUSD would silently misprice every order by 100×. The public
-    // `decimals()` check alone cannot catch this because it always reads 6.
-    it("reverts when a dual-ledger fUSD's confidential layer is not 6 decimals (public is 6)", async () => {
-      const [signer] = await ethers.getSigners();
-      const fusd = await deployDualLedger(4);
-      expect(await fusd.confidentialDecimals()).to.equal(4);
-
-      const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd.getAddress(), signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "InvalidDecimals",
-      );
-    });
-
-    it("accepts a dual-ledger fUSD whose confidential layer is 6 decimals", async () => {
-      const [signer] = await ethers.getSigners();
-      const fusd = await deployDualLedger(6);
-      const otc = (await ethers.deployContract("ConfidentialOTC", [
-        await fusd.getAddress(),
-        signer.address,
-      ])) as unknown as ConfidentialOTC;
+      await token.waitForDeployment();
+      const otc = (await ethers.deployContract("ConfidentialOTC", [signer.address])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
 
-      const config = await otc.getTokenConfig(await fusd.getAddress());
-      expect(config.whitelisted).to.equal(true);
-      expect(config.oraclePrice).to.equal(Q);
-    });
-
-    it("auto-whitelists fUSD at Q_DENOM", async () => {
-      const { otc, fusdAddr } = await setup();
-      const config = await otc.getTokenConfig(fusdAddr);
-      expect(config.whitelisted).to.equal(true);
-      expect(config.oraclePrice).to.equal(Q); // Q_DENOM = 2^20
+      const config = await otc.getTokenConfig(await token.getAddress());
+      expect(config.whitelisted).to.equal(false);
     });
   });
 
@@ -655,17 +610,7 @@ describe("ConfidentialOTC", () => {
 
     it("ethBondSize reverts when the ETH oracle price is unset", async () => {
       const [deployer] = await ethers.getSigners();
-      const fusd = (await ethers.deployContract("FHERC20_Harness", [
-        "Confidential USD",
-        "fUSD",
-        6,
-        "",
-      ])) as unknown as ConfidentialToken;
-      await fusd.waitForDeployment();
-      const otc = (await ethers.deployContract("ConfidentialOTC", [
-        await fusd.getAddress(),
-        deployer.address,
-      ])) as unknown as ConfidentialOTC;
+      const otc = (await ethers.deployContract("ConfidentialOTC", [deployer.address])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
       await expect(otc.connect(deployer).ethBondSize()).to.be.revertedWithCustomError(otc, "EthOracleUnset");
     });
@@ -2803,12 +2748,12 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, bob.address, mBTC);
     });
 
-    it("never reports fUSD as stale — it is the pinned unit of account", async () => {
+    it("ages a $1 stablecoin's price like any other token's", async () => {
       const { otc, fusdAddr, ecbtcAddr } = await setup();
 
       await advance(TWO_DAYS * 5);
 
-      expect(await otc.isPriceStale(fusdAddr)).to.equal(false);
+      expect(await otc.isPriceStale(fusdAddr)).to.equal(true);
       expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
     });
 

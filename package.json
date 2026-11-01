@@ -7,7 +7,7 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
-    "check-types": "tsc --noEmit",
+    "check-types": "hardhat compile && tsc --noEmit",
     "format:sol": "forge fmt contracts"
   },
   "dependencies": {

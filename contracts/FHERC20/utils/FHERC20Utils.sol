@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import { FHE, ebool, euint64, sharedEbool } from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+
+import { IERC7984Receiver } from "../../interfaces/IERC7984Receiver.sol";
+import { FHERC20InvalidReceiver } from "./FHERC20Errors.sol";
+
+/// @dev Library that provides common {FHERC20} utility functions.
+library FHERC20Utils {
+    /**
+     * @dev Performs a transfer callback to the recipient of the transfer `to`. Should be invoked
+     * after all transfers "withCallback" on a {FHERC20}.
+     *
+     * The transfer callback is not invoked on the recipient if the recipient has no code (i.e. is an EOA). If the
+     * recipient has non-zero code, it must implement
+     * {IERC7984Receiver-onConfidentialTransferReceived} and return a `sharedEbool` indicating
+     * whether the transfer was accepted or not. If it decodes to `false`, the transfer function
+     * should try to refund the `from` address.
+     */
+    function checkOnTransferReceived(
+        address operator,
+        address from,
+        address to,
+        euint64 amount,
+        bytes calldata data
+    ) internal returns (ebool) {
+        if (to.code.length > 0) {
+            try
+                IERC7984Receiver(to).onConfidentialTransferReceived(
+                    operator,
+                    from,
+                    FHE.shareEuint64(amount, to),
+                    data
+                )
+            returns (sharedEbool retval) {
+                return FHE.receiveEboolFromCall(retval, to);
+            } catch (bytes memory reason) {
+                if (reason.length == 0) {
+                    revert FHERC20InvalidReceiver(to);
+                } else {
+                    assembly ("memory-safe") {
+                        revert(add(32, reason), mload(reason))
+                    }
+                }
+            }
+        } else {
+            return FHE.asEbool(true);
+        }
+    }
+}

@@ -13,41 +13,11 @@ type HardhatEthersSigner = Awaited<ReturnType<typeof hre.ethers.getSigners>>[num
 /** Mintable FHERC20 stand-in (existing repo harness — replaces MockFUSD/MockOTCToken/MockDecimalsToken). */
 type ConfidentialToken = FHERC20_Harness;
 
-// Dual-ledger (public ERC-20 + confidential layer) tokens link the shared library.
-// Used to pin that the OTC checks `confidentialDecimals()` — the ledger it trades on —
-// rather than the public `decimals()`.
-const LIB_FQN = "contracts/ERC20Confidential/ERC20ConfidentialLib.sol:ERC20ConfidentialLib";
-
-async function linkedFactory(name: string) {
-  const lib = await ethers.deployContract(LIB_FQN);
-  await lib.waitForDeployment();
-  return ethers.getContractFactory(name, { libraries: { [LIB_FQN]: await lib.getAddress() } });
-}
-
-/** 6-decimal public ledger scaled to `confDecimals` confidential precision (mirrors FUSDJmi). */
-async function deployDualLedger(confDecimals: number) {
-  const Harness = await linkedFactory("ConfidentialHarness");
-  const token = await Harness.deploy();
+/** Dual-ledger token: `publicDecimals` on `decimals()`, `confDecimals` on `confidentialDecimals()`. */
+async function deployDualLedger(publicDecimals: number, confDecimals: number) {
+  const token = await ethers.deployContract("MockDualLedgerToken", [publicDecimals, confDecimals]);
   await token.waitForDeployment();
-  await (await token.initialize(confDecimals)).wait();
   return token;
-}
-
-/** FhenixToken: 18-decimal public ledger, `confDecimals` confidential precision (proxy deploy). */
-async function deployFhenixToken(confDecimals: number) {
-  const [deployer] = await ethers.getSigners();
-  const implFactory = await linkedFactory("FhenixTokenHarness");
-  const impl = await implFactory.deploy();
-  await impl.waitForDeployment();
-  const initData = impl.interface.encodeFunctionData("initialize", [
-    deployer.address,
-    deployer.address,
-    0,
-    confDecimals,
-  ]);
-  const proxy = await ethers.deployContract("ERC1967Proxy", [await impl.getAddress(), initData]);
-  await proxy.waitForDeployment();
-  return implFactory.attach(await proxy.getAddress());
 }
 
 const Q = 1_048_576n; // 2^20 — Q44.20 denominator (oracle prices, fee)
@@ -361,7 +331,7 @@ describe("ConfidentialOTC", () => {
 
       // A 4-decimal ledger at $1,000/whole: $100 is 0.1 token = 1_000 raw, so the
       // decimals rescale is folded into the thresholds too.
-      const token4 = await deployDualLedger(4);
+      const token4 = await deployDualLedger(6, 4);
       const token4Addr = await token4.getAddress();
       await (await otc.connect(deployer).whitelistToken(token4Addr, 1_000n * Q)).wait();
       expect((await otc.getTokenConfig(token4Addr)).decimals).to.equal(4);
@@ -414,9 +384,7 @@ describe("ConfidentialOTC", () => {
     // Dual-ledger tokens: the check must target the confidential layer, not the public ERC-20.
     it("whitelists a dual-ledger token with 18 public / 6 confidential decimals", async () => {
       const { deployer, otc } = await setup();
-      const Mock = await linkedFactory("MockERC20Confidential");
-      const token = await Mock.deploy("Confidential Token", "CTK", 18); // public 18 → confidential clamped to 6
-      await token.waitForDeployment();
+      const token = await deployDualLedger(18, 6);
       expect(await token.decimals()).to.equal(18);
       expect(await token.confidentialDecimals()).to.equal(6);
 
@@ -427,7 +395,7 @@ describe("ConfidentialOTC", () => {
 
     it("whitelists a dual-ledger token with 6 public / 4 confidential decimals", async () => {
       const { deployer, otc } = await setup();
-      const token = await deployDualLedger(4);
+      const token = await deployDualLedger(6, 4);
       const tokenAddr = await token.getAddress();
       await (await otc.connect(deployer).whitelistToken(tokenAddr, 1_000n * Q)).wait();
       expect((await otc.getTokenConfig(tokenAddr)).whitelisted).to.equal(true);
@@ -435,7 +403,7 @@ describe("ConfidentialOTC", () => {
 
     it("whitelistToken reverts for a dual-ledger token whose confidential layer exceeds 6 decimals", async () => {
       const { deployer, otc } = await setup();
-      const token = await deployFhenixToken(8); // public 18 / confidential 8
+      const token = await deployDualLedger(18, 8);
       expect(await token.confidentialDecimals()).to.equal(8);
       await expect(otc.connect(deployer).whitelistToken(await token.getAddress(), Q)).to.be.revertedWithCustomError(
         otc,

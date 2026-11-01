@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {sharedEbool, sharedEuint64} from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+
+/// @dev Interface for contracts that can receive FHERC20 transfers with a callback.
+interface IERC7984Receiver {
+    /**
+     * @dev Called upon receiving a confidential token transfer. Returns an encrypted boolean indicating success
+     * of the callback. If false is returned, the token contract will attempt to refund the transfer.
+     *
+     * `amount` arrives as a `sharedEuint64` directed at this contract by the calling token; unwrap it with
+     * {FHE-receiveEuint64Param}. The returned `sharedEbool` must be produced with {FHE-shareEbool} naming
+     * `msg.sender`, so the token can verify the answer came from this contract.
+     *
+     * WARNING: Do not manually refund the transfer AND return false, as this can lead to double refunds.
+     */
+    function onConfidentialTransferReceived(
+        address operator,
+        address from,
+        sharedEuint64 amount,
+        bytes calldata data
+    ) external returns (sharedEbool);
+}

@@ -1,0 +1,35 @@
+{
+  "name": "@fhenixprotocol/trading-module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Confidential OTC trading contracts for Fhenix",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "check-types": "tsc --noEmit",
+    "format:sol": "forge fmt contracts"
+  },
+  "dependencies": {
+    "@fhenixprotocol/cofhe-contracts": "1.0.0",
+    "@openzeppelin/contracts": "^5.2.0"
+  },
+  "devDependencies": {
+    "@cofhe/hardhat-plugin": "0.8.0",
+    "@cofhe/mock-contracts": "0.8.0",
+    "@cofhe/sdk": "0.8.0",
+    "@nomicfoundation/hardhat-chai-matchers": "~2.0.7",
+    "@nomicfoundation/hardhat-ethers": "~3.0.8",
+    "@typechain/ethers-v6": "~0.5.1",
+    "@typechain/hardhat": "~9.1.0",
+    "@types/chai": "^4.2.0",
+    "@types/mocha": "~10.0.8",
+    "@types/node": "^22.0.0",
+    "chai": "~4.5.0",
+    "ethers": "^6.14.0",
+    "hardhat": "~2.26.1",
+    "ts-node": "~10.9.1",
+    "typechain": "~8.3.2",
+    "typescript": "<5.6.0"
+  }
+}

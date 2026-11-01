@@ -67,17 +67,17 @@ const ORACLE_ECBTC = 65_000n * Q; // $65,000 / BTC
 const ORACLE_ECETH = 3_500n * Q; // $3,500  / ETH (also the ETH bond price)
 
 // ── Order prices (Q64.64: output-raw per input-raw) ───────────────────────────
-const PRICE_BTC_FUSD = 65_000n * X64; // ecBTC → fUSD: $65,000 per ecBTC → stored 65_000 / 2^0
-const PRICE_FUSD_BTC = X64 / 65_000n; // fUSD → ecBTC → stored 33_039 / 2^31
+const PRICE_BTC_CUSD = 65_000n * X64; // ecBTC → cUSD: $65,000 per ecBTC → stored 65_000 / 2^0
+const PRICE_CUSD_BTC = X64 / 65_000n; // cUSD → ecBTC → stored 33_039 / 2^31
 const PRICE_BTC_ETH = (65_000n * X64) / 3_500n; // ecBTC → ecETH ≈ 18.57 → stored 38_035 / 2^11
 
 // ── Convenience amounts ────────────────────────────────────────────────────────
 const mBTC = ONE / 1_000n; // 0.001 ecBTC = 1_000 raw → $65 at oracle → NANO
 
 // ── Pre-computed fill costs (verified against the Q44.20 formula) ─────────────
-const FILL_1MBTC_FUSD = 65n * ONE; // 1_000 raw ecBTC → 65_000_000 fUSD ($65)
-const FILL_400RAW_FUSD = 26n * ONE; // 400   raw ecBTC → 26_000_000 fUSD ($26)
-const FILL_200RAW_FUSD = 13n * ONE; // 200   raw ecBTC → 13_000_000 fUSD ($13)
+const FILL_1MBTC_CUSD = 65n * ONE; // 1_000 raw ecBTC → 65_000_000 cUSD ($65)
+const FILL_400RAW_CUSD = 26n * ONE; // 400   raw ecBTC → 26_000_000 cUSD ($26)
+const FILL_200RAW_CUSD = 13n * ONE; // 200   raw ecBTC → 13_000_000 cUSD ($13)
 // PRICE_BTC_ETH is stored as 38_035 / 2^11, so the costs (18_571.78 and
 // 7_428.71) carry a residue; the taker pays the ceiling, so the maker keeps it.
 const FILL_1MBTC_ETH = 18_572n; // 1_000 raw ecBTC → 18_572 raw ecETH
@@ -94,13 +94,13 @@ describe("ConfidentialOTC", () => {
   async function setup() {
     const [deployer, alice, bob] = await ethers.getSigners();
 
-    const fusd = (await ethers.deployContract("FHERC20_Harness", [
+    const cusd = (await ethers.deployContract("FHERC20_Harness", [
       "Confidential USD",
-      "fUSD",
+      "cUSD",
       6,
       "",
     ])) as unknown as ConfidentialToken;
-    await fusd.waitForDeployment();
+    await cusd.waitForDeployment();
 
     const ecbtc = (await ethers.deployContract("FHERC20_Harness", [
       "Confidential WBTC",
@@ -118,14 +118,12 @@ describe("ConfidentialOTC", () => {
     ])) as unknown as ConfidentialToken;
     await eceth.waitForDeployment();
 
-    const otc = (await ethers.deployContract("ConfidentialOTC", [
-      await fusd.getAddress(),
-      deployer.address,
-    ])) as unknown as ConfidentialOTC;
+    const otc = (await ethers.deployContract("ConfidentialOTC", [deployer.address])) as unknown as ConfidentialOTC;
     await otc.waitForDeployment();
 
-    // Whitelist both test tokens at realistic oracle prices, and set the ETH
-    // price used to size fill bonds. fUSD is auto-whitelisted at Q_DENOM.
+    // Whitelist the test tokens at realistic oracle prices (the stablecoin at
+    // $1 = Q_DENOM), and set the ETH price used to size fill bonds.
+    await (await otc.connect(deployer).whitelistToken(await cusd.getAddress(), Q)).wait();
     await (await otc.connect(deployer).whitelistToken(await ecbtc.getAddress(), ORACLE_ECBTC)).wait();
     await (await otc.connect(deployer).whitelistToken(await eceth.getAddress(), ORACLE_ECETH)).wait();
     await (await otc.connect(deployer).setEthOraclePrice(ORACLE_ECETH)).wait();
@@ -134,7 +132,7 @@ describe("ConfidentialOTC", () => {
     const bobClient = await hre.cofhe.createClientWithBatteries(bob);
 
     const otcAddr = await otc.getAddress();
-    const fusdAddr = await fusd.getAddress();
+    const cusdAddr = await cusd.getAddress();
     const ecbtcAddr = await ecbtc.getAddress();
     const ecethAddr = await eceth.getAddress();
 
@@ -142,14 +140,14 @@ describe("ConfidentialOTC", () => {
       deployer,
       alice,
       bob,
-      fusd,
+      cusd,
       ecbtc,
       eceth,
       otc,
       aliceClient,
       bobClient,
       otcAddr,
-      fusdAddr,
+      cusdAddr,
       ecbtcAddr,
       ecethAddr,
     };
@@ -175,23 +173,23 @@ describe("ConfidentialOTC", () => {
   }
 
   /// Mints the input leg to the maker (+ operator grant) and, when the trade
-  /// uses fUSD as a leg, mints `fusdAmount` fUSD too. The maker bond defaults
+  /// uses cUSD as a leg, mints `cusdAmount` cUSD too. The maker bond defaults
   /// to 0, so no ETH is required at create.
   async function fundMaker(
     maker: HardhatEthersSigner,
     token: ConfidentialToken,
     tokenAmount: bigint,
-    fusd: ConfidentialToken,
-    fusdAmount: bigint,
+    cusd: ConfidentialToken,
+    cusdAmount: bigint,
     otcAddr: string,
   ) {
-    if ((await token.getAddress()) !== (await fusd.getAddress())) {
+    if ((await token.getAddress()) !== (await cusd.getAddress())) {
       await (await token.mint(maker.address, tokenAmount)).wait();
       await (await token.connect(maker).setOperator(otcAddr, FAR_FUTURE)).wait();
     }
-    if (fusdAmount > 0n) {
-      await (await fusd.mint(maker.address, fusdAmount)).wait();
-      await (await fusd.connect(maker).setOperator(otcAddr, FAR_FUTURE)).wait();
+    if (cusdAmount > 0n) {
+      await (await cusd.mint(maker.address, cusdAmount)).wait();
+      await (await cusd.connect(maker).setOperator(otcAddr, FAR_FUTURE)).wait();
     }
   }
 
@@ -301,68 +299,25 @@ describe("ConfidentialOTC", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("constructor", () => {
-    it("reverts on zero fUSD address", async () => {
-      const [signer] = await ethers.getSigners();
+    it("reverts on zero treasury address", async () => {
       const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(ethers.ZeroAddress, signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "ZeroAddress",
-      );
+      await expect(factory.deploy(ethers.ZeroAddress)).to.be.revertedWithCustomError(factory, "ZeroAddress");
     });
 
-    it("reverts when fUSD does not use exactly 6 decimals", async () => {
-      const fusd18 = (await ethers.deployContract("FHERC20_Harness", [
-        "fUSD18",
-        "fUSD18",
-        18,
+    it("deploys with an empty whitelist — no token is auto-listed", async () => {
+      const [signer] = await ethers.getSigners();
+      const token = (await ethers.deployContract("FHERC20_Harness", [
+        "Confidential USD",
+        "cUSD",
+        6,
         "",
       ])) as unknown as ConfidentialToken;
-      await fusd18.waitForDeployment();
-
-      const [signer] = await ethers.getSigners();
-      const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd18.getAddress(), signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "InvalidDecimals",
-      );
-    });
-
-    // Dual-ledger fUSD (FUSDJmi shape): the public ledger is always 6 decimals, but the
-    // confidential layer — the only ledger the OTC escrows and settles on — can be coarser.
-    // The bracket thresholds and the $1 auto-price are in 6-decimal confidential units, so a
-    // 4-decimal confidential fUSD would silently misprice every order by 100×. The public
-    // `decimals()` check alone cannot catch this because it always reads 6.
-    it("reverts when a dual-ledger fUSD's confidential layer is not 6 decimals (public is 6)", async () => {
-      const [signer] = await ethers.getSigners();
-      const fusd = await deployDualLedger(4);
-      expect(await fusd.confidentialDecimals()).to.equal(4);
-
-      const factory = await ethers.getContractFactory("ConfidentialOTC");
-      await expect(factory.deploy(await fusd.getAddress(), signer.address)).to.be.revertedWithCustomError(
-        factory,
-        "InvalidDecimals",
-      );
-    });
-
-    it("accepts a dual-ledger fUSD whose confidential layer is 6 decimals", async () => {
-      const [signer] = await ethers.getSigners();
-      const fusd = await deployDualLedger(6);
-      const otc = (await ethers.deployContract("ConfidentialOTC", [
-        await fusd.getAddress(),
-        signer.address,
-      ])) as unknown as ConfidentialOTC;
+      await token.waitForDeployment();
+      const otc = (await ethers.deployContract("ConfidentialOTC", [signer.address])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
 
-      const config = await otc.getTokenConfig(await fusd.getAddress());
-      expect(config.whitelisted).to.equal(true);
-      expect(config.oraclePrice).to.equal(Q);
-    });
-
-    it("auto-whitelists fUSD at Q_DENOM", async () => {
-      const { otc, fusdAddr } = await setup();
-      const config = await otc.getTokenConfig(fusdAddr);
-      expect(config.whitelisted).to.equal(true);
-      expect(config.oraclePrice).to.equal(Q); // Q_DENOM = 2^20
+      const config = await otc.getTokenConfig(await token.getAddress());
+      expect(config.whitelisted).to.equal(false);
     });
   });
 
@@ -392,10 +347,10 @@ describe("ConfidentialOTC", () => {
     }
 
     it("derives raw-unit bracket thresholds on whitelist and re-derives them on every price push", async () => {
-      const { deployer, otc, fusdAddr, ecbtcAddr } = await setup();
+      const { deployer, otc, cusdAddr, ecbtcAddr } = await setup();
 
-      // fUSD at $1 with 6 decimals: raw units ARE fUSD units, so the bounds are the USD maxima.
-      await expectThresholds(otc, fusdAddr, [1n, 100_000_000n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n]);
+      // cUSD at $1 with 6 decimals: raw units ARE cUSD units, so the bounds are the USD maxima.
+      await expectThresholds(otc, cusdAddr, [1n, 100_000_000n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n]);
 
       // ecBTC at $65,000: each bound is ceil(MAX / 65_000) raw units.
       await expectThresholds(otc, ecbtcAddr, [1n, 1_539n, 15_385n, 153_847n, 1_538_462n]);
@@ -495,7 +450,7 @@ describe("ConfidentialOTC", () => {
     });
 
     it("createOrder reverts with TokenNotWhitelisted when either leg is not whitelisted", async () => {
-      const { alice, otc, aliceClient, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, otc, aliceClient, cusdAddr, ecbtcAddr } = await setup();
       const unlisted = (await ethers.deployContract("FHERC20_Harness", [
         "U",
         "U",
@@ -506,11 +461,11 @@ describe("ConfidentialOTC", () => {
       const amt = await enc(aliceClient, mBTC, otc);
 
       await expect(
-        otc.connect(alice).createOrder(await unlisted.getAddress(), fusdAddr, PRICE_BTC_FUSD, 0n, ...amt),
+        otc.connect(alice).createOrder(await unlisted.getAddress(), cusdAddr, PRICE_BTC_CUSD, 0n, ...amt),
       ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
 
       await expect(
-        otc.connect(alice).createOrder(ecbtcAddr, await unlisted.getAddress(), PRICE_BTC_FUSD, 0n, ...amt),
+        otc.connect(alice).createOrder(ecbtcAddr, await unlisted.getAddress(), PRICE_BTC_CUSD, 0n, ...amt),
       ).to.be.revertedWithCustomError(otc, "TokenNotWhitelisted");
     });
 
@@ -655,17 +610,7 @@ describe("ConfidentialOTC", () => {
 
     it("ethBondSize reverts when the ETH oracle price is unset", async () => {
       const [deployer] = await ethers.getSigners();
-      const fusd = (await ethers.deployContract("FHERC20_Harness", [
-        "Confidential USD",
-        "fUSD",
-        6,
-        "",
-      ])) as unknown as ConfidentialToken;
-      await fusd.waitForDeployment();
-      const otc = (await ethers.deployContract("ConfidentialOTC", [
-        await fusd.getAddress(),
-        deployer.address,
-      ])) as unknown as ConfidentialOTC;
+      const otc = (await ethers.deployContract("ConfidentialOTC", [deployer.address])) as unknown as ConfidentialOTC;
       await otc.waitForDeployment();
       await expect(otc.connect(deployer).ethBondSize()).to.be.revertedWithCustomError(otc, "EthOracleUnset");
     });
@@ -677,16 +622,16 @@ describe("ConfidentialOTC", () => {
 
   describe("createOrder / activateOrder", () => {
     it("creates a pending order that escrows input, then publishes + lists it", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       // 1 mBTC = 0.001 BTC @ $65,000 = $65 → NANO
       const id = await createOrder(
         otc,
         alice,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -700,7 +645,7 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, otcAddr, mBTC); // 1 mBTC escrowed
       await expectBalance(ecbtc, alice.address, ONE - mBTC);
       await hre.cofhe.mocks.expectPlaintext(order.bracketHandle, NANO); // encrypted snapshot
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
 
       await activate(otc, alice, aliceClient, id);
 
@@ -711,54 +656,54 @@ describe("ConfidentialOTC", () => {
       expect(order.publishedSeq).to.equal(1n);
       expect(order.maker).to.equal(alice.address);
       expect(order.inputToken).to.equal(ecbtcAddr);
-      expect(order.outputToken).to.equal(fusdAddr);
-      expect(order.price).to.equal(65_000n); // PRICE_BTC_FUSD as 65_000 / 2^0
+      expect(order.outputToken).to.equal(cusdAddr);
+      expect(order.price).to.equal(65_000n); // PRICE_BTC_CUSD as 65_000 / 2^0
       expect(order.priceShift).to.equal(0n);
 
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).map(x => x)).to.deep.equal([id]);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).map(x => x)).to.deep.equal([id]);
     });
 
-    it("publishes SMALL for a $130 order (2 mBTC @ $65,000, outputToken == fUSD)", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+    it("publishes SMALL for a $130 order (2 mBTC @ $65,000, outputToken == cUSD)", async () => {
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, 2n * mBTC, otc)),
       );
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
     });
 
-    it("computes bracket from the raw fUSD amount (fUSD→ecBTC, inputToken == fUSD)", async () => {
-      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, fusd, 0n, fusd, 200n * ONE, otcAddr);
+    it("computes bracket from the raw cUSD amount (cUSD→ecBTC, inputToken == cUSD)", async () => {
+      const { alice, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, cusd, 0n, cusd, 200n * ONE, otcAddr);
 
-      // Escrow 200 fUSD ($200) selling for ecBTC → SMALL.
+      // Escrow 200 cUSD ($200) selling for ecBTC → SMALL.
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
-        fusdAddr,
+        cusdAddr,
         ecbtcAddr,
-        PRICE_FUSD_BTC,
+        PRICE_CUSD_BTC,
         0n,
         ...(await enc(aliceClient, 200n * ONE, otc)),
       );
-      await expectBalance(fusd, otcAddr, 200n * ONE); // no cleanup fee anymore
+      await expectBalance(cusd, otcAddr, 200n * ONE); // no cleanup fee anymore
       expect((await otc.getOrder(id)).bracket).to.equal(SMALL);
     });
 
     it("brackets from the oracle, so a maker cannot inflate their own size via price", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
-      // The bracket rate used to come from o.price on cANY→fUSD orders. At
+      // The bracket rate used to come from o.price on cANY→cUSD orders. At
       // uint64.max the overflow cap collapses to 1, so 1 raw unit multiplied
       // out to 17_592_186_044_415 ($17.6M) — 176x the WHALE floor. Sourcing
       // the rate from the ecBTC oracle values it at what it is: $0.000065.
@@ -767,7 +712,7 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
+        cusdAddr,
         ((1n << 64n) - 1n) << 44n, // the Q44.20 uint64.max rate, in Q64.64
         0n,
         ...(await enc(aliceClient, 1n, otc)),
@@ -777,31 +722,31 @@ describe("ConfidentialOTC", () => {
     });
 
     it("reverts on zero address, same leg, zero price, and bad expiry", async () => {
-      const { alice, otc, aliceClient, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, otc, aliceClient, cusdAddr, ecbtcAddr } = await setup();
       const amt = await enc(aliceClient, mBTC, otc);
 
       await expect(
-        otc.connect(alice).createOrder(ethers.ZeroAddress, fusdAddr, PRICE_BTC_FUSD, 0n, ...amt),
+        otc.connect(alice).createOrder(ethers.ZeroAddress, cusdAddr, PRICE_BTC_CUSD, 0n, ...amt),
       ).to.be.revertedWithCustomError(otc, "ZeroAddress");
 
       await expect(
-        otc.connect(alice).createOrder(fusdAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...amt),
+        otc.connect(alice).createOrder(cusdAddr, cusdAddr, PRICE_BTC_CUSD, 0n, ...amt),
       ).to.be.revertedWithCustomError(otc, "SameLeg");
 
-      await expect(otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, 0n, 0n, ...amt)).to.be.revertedWithCustomError(
+      await expect(otc.connect(alice).createOrder(ecbtcAddr, cusdAddr, 0n, 0n, ...amt)).to.be.revertedWithCustomError(
         otc,
         "ZeroPrice",
       );
 
       const past = BigInt((await ethers.provider.getBlock("latest"))!.timestamp) - 1n;
       await expect(
-        otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, past, ...amt),
+        otc.connect(alice).createOrder(ecbtcAddr, cusdAddr, PRICE_BTC_CUSD, past, ...amt),
       ).to.be.revertedWithCustomError(otc, "InvalidExpiry");
     });
 
     it("cannot activate an unknown order, and cannot re-publish a settled record", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       await expect(otc.connect(alice).activateOrder(999n, 1, "0x")).to.be.revertedWithCustomError(otc, "OrderNotFound");
 
       const id = await createAndActivate(
@@ -809,8 +754,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -823,63 +768,63 @@ describe("ConfidentialOTC", () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // fillOrder (fUSD leg)
+  // fillOrder (cUSD leg)
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("fillOrder", () => {
-    /// Maker alice posts 1 mBTC ($65) @ PRICE_BTC_FUSD → NANO bracket.
+    /// Maker alice posts 1 mBTC ($65) @ PRICE_BTC_CUSD → NANO bracket.
     async function withOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
       return { ...ctx, id };
     }
 
-    it("fully fills: taker pays fUSD, receives ecBTC, bracket → EMPTY + delisted", async () => {
-      const { alice, bob, ecbtc, fusd, otc, bobClient, otcAddr, fusdAddr, ecbtcAddr, id } = await withOrder();
+    it("fully fills: taker pays cUSD, receives ecBTC, bracket → EMPTY + delisted", async () => {
+      const { alice, bob, ecbtc, cusd, otc, bobClient, otcAddr, cusdAddr, ecbtcAddr, id } = await withOrder();
 
       const seq = await fill(otc, bob, bobClient, id, mBTC);
 
       await expectBalance(ecbtc, bob.address, mBTC); // taker got 1 mBTC
       await expectBalance(ecbtc, otcAddr, 0n); // escrow drained
-      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
-      await expectBalance(fusd, alice.address, FILL_1MBTC_FUSD); // maker received $65
+      await expectBalance(cusd, bob.address, 1_000n * ONE - FILL_1MBTC_CUSD);
+      await expectBalance(cusd, alice.address, FILL_1MBTC_CUSD); // maker received $65
 
       // Still listed + stale (NANO) until the post-fill publish lands.
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(1);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(1);
 
       const value = await publish(otc, bob, bobClient, id, seq);
       expect(value).to.equal(EMPTY);
       const order = await otc.getOrder(id);
       expect(order.bracket).to.equal(EMPTY);
       expect(order.active).to.equal(false); // frontier EMPTY delists
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
 
       expect((await otc.getTakerFills(bob.address)).map(x => x)).to.deep.equal([id]);
     });
 
     it("partially fills and keeps the order active with an updated bracket", async () => {
-      const { bob, ecbtc, fusd, otc, bobClient, otcAddr, id } = await withOrder();
+      const { bob, ecbtc, cusd, otc, bobClient, otcAddr, id } = await withOrder();
 
       const value = await fillAndPublish(otc, bob, bobClient, id, 400n);
 
       await expectBalance(ecbtc, bob.address, 400n);
       await expectBalance(ecbtc, otcAddr, 600n); // 600 raw remaining
-      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_400RAW_FUSD);
+      await expectBalance(cusd, bob.address, 1_000n * ONE - FILL_400RAW_CUSD);
 
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(true);
@@ -888,29 +833,29 @@ describe("ConfidentialOTC", () => {
     });
 
     it("caps the fill at the remaining size when the taker over-requests", async () => {
-      const { bob, ecbtc, fusd, otc, bobClient, otcAddr, id } = await withOrder();
+      const { bob, ecbtc, cusd, otc, bobClient, otcAddr, id } = await withOrder();
 
       await fill(otc, bob, bobClient, id, 10n * mBTC); // wants 10 mBTC, only 1 remains
 
       await expectBalance(ecbtc, bob.address, mBTC);
       await expectBalance(ecbtc, otcAddr, 0n);
-      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
+      await expectBalance(cusd, bob.address, 1_000n * ONE - FILL_1MBTC_CUSD);
     });
 
     it("releases nothing when the taker cannot cover the full payment (no free drain)", async () => {
-      const { alice, bob, ecbtc, fusd, otc, bobClient, otcAddr, fusdAddr, ecbtcAddr, aliceClient } = await setup();
+      const { alice, bob, ecbtc, cusd, otc, bobClient, otcAddr, cusdAddr, ecbtcAddr, aliceClient } = await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 30n * ONE)).wait(); // enough for $26, not $65
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 30n * ONE)).wait(); // enough for $26, not $65
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -919,13 +864,13 @@ describe("ConfidentialOTC", () => {
       const v1 = await fillAndPublish(otc, bob, bobClient, id, mBTC);
       await expectBalance(ecbtc, bob.address, 0n);
       await expectBalance(ecbtc, otcAddr, mBTC);
-      await expectBalance(fusd, bob.address, 30n * ONE);
+      await expectBalance(cusd, bob.address, 30n * ONE);
       expect(v1).to.equal(NANO);
 
       // A fill he CAN afford: 400 raw ecBTC costs $26.
       await fillAndPublish(otc, bob, bobClient, id, 400n);
       await expectBalance(ecbtc, bob.address, 400n);
-      await expectBalance(fusd, bob.address, 30n * ONE - FILL_400RAW_FUSD);
+      await expectBalance(cusd, bob.address, 30n * ONE - FILL_400RAW_CUSD);
     });
 
     it("reverts without the ETH bond", async () => {
@@ -936,19 +881,19 @@ describe("ConfidentialOTC", () => {
     });
 
     it("reverts on unknown, pending, or inactive orders", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
       const bond = await otc.ethBondSize();
       await expect(
         otc.connect(bob).fillOrder(999n, ...(await enc(bobClient, mBTC, otc)), { value: bond }),
       ).to.be.revertedWithCustomError(otc, "OrderNotFound");
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       const id = await createOrder(
         otc,
         alice,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -965,7 +910,7 @@ describe("ConfidentialOTC", () => {
   describe("price resolution", () => {
     // Under the old fixed Q44.20 point, a $84,000 BTC bid could only be quoted
     // at $87,381 or $80,660, a 4-decimal BTC could not be bid above $10,485.76,
-    // and a fUSD bid for a $0.0001 token filled at most $1,759 at a time.
+    // and a cUSD bid for a $0.0001 token filled at most $1,759 at a time.
     // Expected values are worked out with exact integer math outside the
     // contract, not by mirroring it.
     const BTC_USD = 84_000n;
@@ -992,16 +937,16 @@ describe("ConfidentialOTC", () => {
     // 2^64 / 84,000 normalizes to shift 32, where the exact mantissa is
     // 51,130.56 — rounded up to 51,131, i.e. 2^32 / 51,131 = $83,999.28 per BTC.
     // Its neighbours are $84,000.93 (above the maker's limit) and $83,997.64.
-    it("stores a $84,000 fUSD → cBTC bid as 51_131 / 2^32 — $83,999.28, never above the maker's limit", async () => {
-      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr } = await setup();
+    it("stores a $84,000 cUSD → cBTC bid as 51_131 / 2^32 — $83,999.28, never above the maker's limit", async () => {
+      const { alice, cusd, otc, aliceClient, otcAddr, cusdAddr } = await setup();
       const { addr: cbtcAddr } = await listToken(otc, "cBTC", 6, BTC_USD * Q);
-      await fundMaker(alice, fusd, 0n, fusd, BTC_USD * ONE, otcAddr);
+      await fundMaker(alice, cusd, 0n, cusd, BTC_USD * ONE, otcAddr);
 
       await expect(
-        otc.connect(alice).createOrder(fusdAddr, cbtcAddr, X64 / BTC_USD, 0n, ...(await enc(aliceClient, ONE, otc))),
+        otc.connect(alice).createOrder(cusdAddr, cbtcAddr, X64 / BTC_USD, 0n, ...(await enc(aliceClient, ONE, otc))),
       )
         .to.emit(otc, "OrderCreated")
-        .withArgs(0n, alice.address, fusdAddr, cbtcAddr, 51_131n, 32n, 0n);
+        .withArgs(0n, alice.address, cusdAddr, cbtcAddr, 51_131n, 32n, 0n);
 
       await expectStored(otc, 0n, 51_131n, 32n);
       expect(((1n << 32n) * 100n) / 51_131n).to.equal(8_399_928n); // $83,999.28, in cents
@@ -1009,45 +954,45 @@ describe("ConfidentialOTC", () => {
     });
 
     it("pays a taker selling exactly 1 BTC into that bid $83,999.28", async () => {
-      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr } = await setup();
+      const { alice, bob, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr } = await setup();
       const { token: cbtc, addr: cbtcAddr } = await listToken(otc, "cBTC", 6, BTC_USD * Q);
-      await fundMaker(alice, fusd, 0n, fusd, BTC_USD * ONE, otcAddr);
-      await fundMaker(bob, cbtc, ONE, fusd, 0n, otcAddr); // 1 BTC
+      await fundMaker(alice, cusd, 0n, cusd, BTC_USD * ONE, otcAddr);
+      await fundMaker(bob, cbtc, ONE, cusd, 0n, otcAddr); // 1 BTC
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
-        fusdAddr,
+        cusdAddr,
         cbtcAddr,
         X64 / BTC_USD,
         0n,
         ...(await enc(aliceClient, BTC_USD * ONE, otc)),
       );
 
-      // The largest fUSD request whose ceil'd cost is still exactly 1,000,000 raw cBTC.
+      // The largest cUSD request whose ceil'd cost is still exactly 1,000,000 raw cBTC.
       const want = 83_999_282_157n;
       await fill(otc, bob, bobClient, id, want);
 
       await expectBalance(cbtc, bob.address, 0n);
       await expectBalance(cbtc, alice.address, ONE);
-      await expectBalance(fusd, bob.address, want);
-      await expectBalance(fusd, otcAddr, BTC_USD * ONE - want); // $0.72 left to fill
+      await expectBalance(cusd, bob.address, want);
+      await expectBalance(cusd, otcAddr, BTC_USD * ONE - want); // $0.72 left to fill
     });
 
     // One raw unit of a 4-decimal BTC is 0.0001 BTC ($8.40), so the rate is
     // 2^64 / 8,400,000 → 65,448 / 2^39 = $83,998.87 per BTC.
     it("quotes and fills a 4-decimal BTC bid at market: 1 BTC for $83,998.87", async () => {
-      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr } = await setup();
+      const { alice, bob, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr } = await setup();
       const { token: cbtc4, addr: cbtc4Addr } = await listToken(otc, "cBTC4", 4, BTC_USD * Q);
-      await fundMaker(alice, fusd, 0n, fusd, BTC_USD * ONE, otcAddr);
-      await fundMaker(bob, cbtc4, 10_000n, fusd, 0n, otcAddr); // 1 BTC
+      await fundMaker(alice, cusd, 0n, cusd, BTC_USD * ONE, otcAddr);
+      await fundMaker(bob, cbtc4, 10_000n, cusd, 0n, otcAddr); // 1 BTC
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
-        fusdAddr,
+        cusdAddr,
         cbtc4Addr,
         X64 / 8_400_000n,
         0n,
@@ -1060,24 +1005,24 @@ describe("ConfidentialOTC", () => {
 
       await expectBalance(cbtc4, bob.address, 0n);
       await expectBalance(cbtc4, alice.address, 10_000n);
-      await expectBalance(fusd, bob.address, want);
+      await expectBalance(cusd, bob.address, want);
     });
 
-    // 10,000 raw T per raw fUSD stores as 40,000 / 2^2, so _fillCap allows
-    // ~4.6e14 raw fUSD ($461M) per fill instead of the old $1,759.
-    it("fills a $10,000 fUSD bid for a $0.0001 token in one go", async () => {
-      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr } = await setup();
+    // 10,000 raw T per raw cUSD stores as 40,000 / 2^2, so _fillCap allows
+    // ~4.6e14 raw cUSD ($461M) per fill instead of the old $1,759.
+    it("fills a $10,000 cUSD bid for a $0.0001 token in one go", async () => {
+      const { alice, bob, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr } = await setup();
       const { token: t, addr: tAddr } = await listToken(otc, "T", 6, 104n); // floor($0.0001 × 2^20)
 
       const escrow = 10_000n * ONE;
-      await fundMaker(alice, fusd, 0n, fusd, escrow, otcAddr);
-      await fundMaker(bob, t, escrow * 10_000n, fusd, 0n, otcAddr);
+      await fundMaker(alice, cusd, 0n, cusd, escrow, otcAddr);
+      await fundMaker(bob, t, escrow * 10_000n, cusd, 0n, otcAddr);
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
-        fusdAddr,
+        cusdAddr,
         tAddr,
         10_000n * X64,
         0n,
@@ -1087,27 +1032,27 @@ describe("ConfidentialOTC", () => {
 
       await fill(otc, bob, bobClient, id, escrow);
 
-      await expectBalance(fusd, bob.address, escrow);
-      await expectBalance(fusd, otcAddr, 0n);
+      await expectBalance(cusd, bob.address, escrow);
+      await expectBalance(cusd, otcAddr, 0n);
       await expectBalance(t, alice.address, escrow * 10_000n);
     });
 
     it("rejects a rate above 2^64 − 1 and stores the largest one that fits", async () => {
-      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, fusd, 0n, fusd, 1_000n * ONE, otcAddr);
+      const { alice, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, cusd, 0n, cusd, 1_000n * ONE, otcAddr);
 
       // (2^128 − 1) / 2^64 rounds up to exactly 2^64, one past the mantissa.
       await expect(
         otc
           .connect(alice)
-          .createOrder(fusdAddr, ecbtcAddr, (1n << 128n) - 1n, 0n, ...(await enc(aliceClient, ONE, otc))),
+          .createOrder(cusdAddr, ecbtcAddr, (1n << 128n) - 1n, 0n, ...(await enc(aliceClient, ONE, otc))),
       ).to.be.revertedWithCustomError(otc, "SafeCastOverflowedUintDowncast");
 
       // The largest integer rate still fits: (2^64 − 1) at shift 0.
       const id = await createOrder(
         otc,
         alice,
-        fusdAddr,
+        cusdAddr,
         ecbtcAddr,
         U64_MAX * X64,
         0n,
@@ -1117,8 +1062,8 @@ describe("ConfidentialOTC", () => {
     });
 
     it("keeps shift 0 from a rate of 2^15, rounds up, and clamps tiny rates at shift 63", async () => {
-      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, fusd, 0n, fusd, 1_000n * ONE, otcAddr);
+      const { alice, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, cusd, 0n, cusd, 1_000n * ONE, otcAddr);
 
       const cases: [bigint, bigint, bigint][] = [
         // [priceX64, stored price, stored shift]
@@ -1132,7 +1077,7 @@ describe("ConfidentialOTC", () => {
         const id = await createOrder(
           otc,
           alice,
-          fusdAddr,
+          cusdAddr,
           ecbtcAddr,
           priceX64,
           0n,
@@ -1146,8 +1091,8 @@ describe("ConfidentialOTC", () => {
     // calldata, so shift 63 (drop 1) can only round priceX64 up to even: at
     // most one Q64.64 step, a relative error of 1 / priceX64.
     it("rounds a sub-2^-48 priceX64 up to even at shift 63, at most one Q64.64 step", async () => {
-      const { alice, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, fusd, 0n, fusd, 1_000n * ONE, otcAddr);
+      const { alice, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, cusd, 0n, cusd, 1_000n * ONE, otcAddr);
 
       const cases: [bigint, bigint][] = [
         // [priceX64, stored price] — all at shift 63, so the stored rate is 2 × price / 2^64
@@ -1160,7 +1105,7 @@ describe("ConfidentialOTC", () => {
         const id = await createOrder(
           otc,
           alice,
-          fusdAddr,
+          cusdAddr,
           ecbtcAddr,
           priceX64,
           0n,
@@ -1178,13 +1123,13 @@ describe("ConfidentialOTC", () => {
     // outputs at most ~2^(64 − s) raw units, so here every fill outputs exactly
     // 1 BTC: the rounded-up output, not the mantissa, sets what a taker pays.
     it("sells $84,000 of a $0.0001 token for 1 0-decimal BTC; each split fill costs a whole BTC", async () => {
-      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr } = await setup();
+      const { alice, bob, cusd, otc, aliceClient, bobClient, otcAddr } = await setup();
       const { token: t, addr: tAddr } = await listToken(otc, "T", 6, 104n); // floor($0.0001 × 2^20)
       const { token: btc0, addr: btc0Addr } = await listToken(otc, "cBTC0", 0, BTC_USD * Q);
 
       const escrow = 840_000_000_000_000n; // 840M T = $84,000
-      await fundMaker(alice, t, escrow, fusd, 0n, otcAddr);
-      await fundMaker(bob, btc0, 2n, fusd, 0n, otcAddr);
+      await fundMaker(alice, t, escrow, cusd, 0n, otcAddr);
+      await fundMaker(bob, btc0, 2n, cusd, 0n, otcAddr);
 
       const id = await createAndActivate(
         otc,
@@ -1215,13 +1160,13 @@ describe("ConfidentialOTC", () => {
     // shift, so one unit less headroom would wrap and release nothing. This
     // covers the mock's shr, a plain `>>`; the coprocessor needs a testnet fill.
     it("runs FHE.shr at shift 0 and shift 63 with the sum on 2^64 − 1, without wrapping", async () => {
-      const { alice, bob, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr } = await setup();
+      const { alice, bob, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr } = await setup();
       const { token: a, addr: aAddr } = await listToken(otc, "A", 6, Q);
       const { token: b, addr: bAddr } = await listToken(otc, "B", 6, Q);
       const HALF = 1n << 63n;
 
-      await fundMaker(alice, a, HALF + 1n, fusd, 0n, otcAddr);
-      await fundMaker(bob, b, U64_MAX, fusd, 1n, otcAddr);
+      await fundMaker(alice, a, HALF + 1n, cusd, 0n, otcAddr);
+      await fundMaker(bob, b, U64_MAX, cusd, 1n, otcAddr);
 
       // Shift 0, mask 0: price 2^64 − 1, so _fillCap is 1 raw unit.
       const id0 = await createAndActivate(
@@ -1248,7 +1193,7 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         aAddr,
-        fusdAddr,
+        cusdAddr,
         1n << 14n,
         0n,
         ...(await enc(aliceClient, HALF, otc)),
@@ -1256,8 +1201,8 @@ describe("ConfidentialOTC", () => {
       await expectStored(otc, id63, 1n << 13n, 63n);
       await fill(otc, bob, bobClient, id63, U64_MAX);
       await expectBalance(a, bob.address, (1n << 50n) + 1n);
-      await expectBalance(fusd, alice.address, 1n);
-      await expectBalance(fusd, bob.address, 0n);
+      await expectBalance(cusd, alice.address, 1n);
+      await expectBalance(cusd, bob.address, 0n);
     });
   });
 
@@ -1266,22 +1211,22 @@ describe("ConfidentialOTC", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("delisted token", () => {
-    /// Active ecBTC → fUSD order, ready for a leg to be delisted under it.
+    /// Active ecBTC → cUSD order, ready for a leg to be delisted under it.
     async function withOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -1299,15 +1244,15 @@ describe("ConfidentialOTC", () => {
     });
 
     it("blocks fills when the requested leg is delisted", async () => {
-      const { deployer, bob, otc, bobClient, fusdAddr, id } = await withOrder();
-      await (await otc.connect(deployer).delistToken(fusdAddr)).wait();
+      const { deployer, bob, otc, bobClient, cusdAddr, id } = await withOrder();
+      await (await otc.connect(deployer).delistToken(cusdAddr)).wait();
 
       // Either direction moves the delisted token to a new holder for value,
       // so both legs gate — not just the one sitting in escrow.
       const bond = await otc.ethBondSize();
       await expect(otc.connect(bob).fillOrder(id, ...(await enc(bobClient, 400n, otc)), { value: bond }))
         .to.be.revertedWithCustomError(otc, "TokenNotWhitelisted")
-        .withArgs(fusdAddr);
+        .withArgs(cusdAddr);
     });
 
     it("blocks top-ups, so a delisted order cannot grow", async () => {
@@ -1351,22 +1296,22 @@ describe("ConfidentialOTC", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("pause", () => {
-    /// Active ecBTC → fUSD order, ready for the contract to be paused under it.
+    /// Active ecBTC → cUSD order, ready for the contract to be paused under it.
     async function withOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -1383,12 +1328,12 @@ describe("ConfidentialOTC", () => {
     });
 
     it("blocks new orders while paused", async () => {
-      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { deployer, alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       await (await otc.connect(deployer).pause()).wait();
 
       await expect(
-        otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
+        otc.connect(alice).createOrder(ecbtcAddr, cusdAddr, PRICE_BTC_CUSD, 0n, ...(await enc(aliceClient, mBTC, otc))),
       ).to.be.revertedWithCustomError(otc, "EnforcedPause");
     });
 
@@ -1441,8 +1386,8 @@ describe("ConfidentialOTC", () => {
     });
 
     it("still lets a pending order activate while paused", async () => {
-      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { deployer, alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       // Created (escrow already moved) but not yet activated when the pause
       // lands. activateOrder is a publish, not an entry — it must stay open so
@@ -1451,8 +1396,8 @@ describe("ConfidentialOTC", () => {
         otc,
         alice,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -1493,17 +1438,17 @@ describe("ConfidentialOTC", () => {
   describe("fill bond / publishBracket window", () => {
     async function withFilledOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, 2n * mBTC, otc)), // 2 mBTC so it can take multiple partial fills
       );
@@ -1663,10 +1608,10 @@ describe("ConfidentialOTC", () => {
     /// unsettled fill records (one per order).
     async function withTwoFills() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
       const ids: bigint[] = [];
       const seqs: bigint[] = [];
       for (let i = 0; i < 2; i++) {
@@ -1675,8 +1620,8 @@ describe("ConfidentialOTC", () => {
           alice,
           aliceClient,
           ecbtcAddr,
-          fusdAddr,
-          PRICE_BTC_FUSD,
+          cusdAddr,
+          PRICE_BTC_CUSD,
           0n,
           ...(await enc(aliceClient, mBTC, otc)),
         );
@@ -1781,20 +1726,20 @@ describe("ConfidentialOTC", () => {
     const FILL = 1n;
     const TOP_UP = 2n;
 
-    /// Maker alice posts 1 mBTC ($65, NANO) @ PRICE_BTC_FUSD; bob holds `takerFusd`.
-    async function withOrder(takerFusd = 1_000n * ONE) {
+    /// Maker alice posts 1 mBTC ($65, NANO) @ PRICE_BTC_CUSD; bob holds `takerCusd`.
+    async function withOrder(takerCusd = 1_000n * ONE) {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, takerFusd)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, takerCusd)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -1854,7 +1799,7 @@ describe("ConfidentialOTC", () => {
       expect(rec.kind).to.equal(FILL);
       expect(rec.depositor).to.equal(bob.address);
       await hre.cofhe.mocks.expectPlaintext(rec.amount, 400n);
-      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_400RAW_FUSD);
+      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_400RAW_CUSD);
 
       for (const handle of [rec.amount, rec.paid]) {
         await expectAllowed(handle, alice.address, true);
@@ -1869,7 +1814,7 @@ describe("ConfidentialOTC", () => {
       const seq = await fill(otc, bob, bobClient, id, 10n * mBTC); // only 1 mBTC remains
       const rec = await otc.getPublish(id, seq);
       await hre.cofhe.mocks.expectPlaintext(rec.amount, mBTC);
-      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_1MBTC_FUSD);
+      await hre.cofhe.mocks.expectPlaintext(rec.paid, FILL_1MBTC_CUSD);
     });
 
     it("records zero amount and zero paid on an underpaid fill, still private to the parties", async () => {
@@ -1898,9 +1843,9 @@ describe("ConfidentialOTC", () => {
 
       const expected = [
         { kind: CREATE, depositor: alice.address, amount: mBTC, paid: 0n },
-        { kind: FILL, depositor: bob.address, amount: 400n, paid: FILL_400RAW_FUSD },
+        { kind: FILL, depositor: bob.address, amount: 400n, paid: FILL_400RAW_CUSD },
         { kind: TOP_UP, depositor: alice.address, amount: mBTC, paid: 0n },
-        { kind: FILL, depositor: bob.address, amount: 200n, paid: FILL_200RAW_FUSD },
+        { kind: FILL, depositor: bob.address, amount: 200n, paid: FILL_200RAW_CUSD },
       ];
       const latest = (await otc.getOrder(id)).latestSeq;
       expect(latest).to.equal(BigInt(expected.length));
@@ -1936,9 +1881,9 @@ describe("ConfidentialOTC", () => {
     /// Alice sells 1 mBTC for ecETH at PRICE_BTC_ETH ($65 → NANO).
     async function withCanyOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, eceth, fusd, otc, aliceClient, otcAddr, ecbtcAddr, ecethAddr } = ctx;
+      const { alice, bob, ecbtc, eceth, cusd, otc, aliceClient, otcAddr, ecbtcAddr, ecethAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       await (await eceth.mint(bob.address, ONE)).wait();
       await (await eceth.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
@@ -1955,11 +1900,11 @@ describe("ConfidentialOTC", () => {
       return { ...ctx, id };
     }
 
-    // The oracle price is per WHOLE token, so `raw × price >> 20` is only in 6-decimal fUSD
+    // The oracle price is per WHOLE token, so `raw × price >> 20` is only in 6-decimal cUSD
     // units when the input token has 6 decimals. A 4-decimal token must be rescaled by
     // 10^(6 − 4): 0.2 ec4 at $65,000 is $13,000 (LARGE). Unscaled it reads as $130 (SMALL).
     it("brackets a 4-decimal input token at its true USD notional (LARGE, not SMALL)", async () => {
-      const { deployer, alice, fusd, otc, aliceClient, otcAddr, ecethAddr } = await setup();
+      const { deployer, alice, cusd, otc, aliceClient, otcAddr, ecethAddr } = await setup();
       const ec4 = (await ethers.deployContract("FHERC20_Harness", [
         "Four",
         "EC4",
@@ -1970,7 +1915,7 @@ describe("ConfidentialOTC", () => {
       const ec4Addr = await ec4.getAddress();
       await (await otc.connect(deployer).whitelistToken(ec4Addr, ORACLE_ECBTC)).wait(); // $65,000 per whole ec4
 
-      await fundMaker(alice, ec4, 10_000n, fusd, 0n, otcAddr); // 1 whole ec4 at 4 decimals
+      await fundMaker(alice, ec4, 10_000n, cusd, 0n, otcAddr); // 1 whole ec4 at 4 decimals
       const id = await createAndActivate(
         otc,
         alice,
@@ -2037,10 +1982,10 @@ describe("ConfidentialOTC", () => {
     });
 
     it("oracle price drop changes bracket on next fill (SMALL → NANO)", async () => {
-      const { deployer, alice, bob, ecbtc, eceth, fusd, otc, aliceClient, bobClient, otcAddr, ecbtcAddr, ecethAddr } =
+      const { deployer, alice, bob, ecbtc, eceth, cusd, otc, aliceClient, bobClient, otcAddr, ecbtcAddr, ecethAddr } =
         await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       await (await eceth.mint(bob.address, 100_000n)).wait();
       await (await eceth.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
@@ -2072,20 +2017,20 @@ describe("ConfidentialOTC", () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("topUpOrder", () => {
-    /// Alice posts 1 mBTC ($65, NANO) and has 1 BTC total. Bob has 1,000 fUSD.
+    /// Alice posts 1 mBTC ($65, NANO) and has 1 BTC total. Bob has 1,000 cUSD.
     async function withOrder() {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2119,7 +2064,7 @@ describe("ConfidentialOTC", () => {
     });
 
     it("topped-up order can be fully filled at the new size", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, id } = await withOrder();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, id } = await withOrder();
 
       await topUpAndPublish(otc, alice, aliceClient, id, mBTC);
 
@@ -2127,17 +2072,17 @@ describe("ConfidentialOTC", () => {
 
       await expectBalance(ecbtc, bob.address, 2n * mBTC);
       await expectBalance(ecbtc, otcAddr, 0n);
-      await expectBalance(fusd, bob.address, 1_000n * ONE - 2n * FILL_1MBTC_FUSD);
+      await expectBalance(cusd, bob.address, 1_000n * ONE - 2n * FILL_1MBTC_CUSD);
       expect(value).to.equal(EMPTY);
     });
 
     it("resurrects a depleted/dormant order (EMPTY → NANO) and re-lists it", async () => {
-      const { alice, bob, ecbtc, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr, id } = await withOrder();
+      const { alice, bob, ecbtc, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr, id } = await withOrder();
 
       // Deplete fully and publish EMPTY → order becomes dormant (delisted).
       await fillAndPublish(otc, bob, bobClient, id, mBTC);
       expect((await otc.getOrder(id)).active).to.equal(false);
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
 
       // Top up + publish re-lists it (frontier non-EMPTY).
       const value = await topUpAndPublish(otc, alice, aliceClient, id, mBTC);
@@ -2145,20 +2090,20 @@ describe("ConfidentialOTC", () => {
       expect(value).to.equal(NANO);
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(true);
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).map(x => x)).to.deep.equal([id]);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).map(x => x)).to.deep.equal([id]);
     });
 
     it("only the maker can top up, and not on a closed order", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2182,15 +2127,15 @@ describe("ConfidentialOTC", () => {
   describe("cancelOrder", () => {
     async function withOrder() {
       const ctx = await setup();
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2198,7 +2143,7 @@ describe("ConfidentialOTC", () => {
     }
 
     it("returns the escrow, marks EMPTY + closed, and de-lists", async () => {
-      const { alice, ecbtc, otc, otcAddr, fusdAddr, ecbtcAddr, id } = await withOrder();
+      const { alice, ecbtc, otc, otcAddr, cusdAddr, ecbtcAddr, id } = await withOrder();
 
       await (await otc.connect(alice).cancelOrder(id)).wait();
 
@@ -2209,21 +2154,21 @@ describe("ConfidentialOTC", () => {
       expect(order.active).to.equal(false);
       expect(order.closed).to.equal(true);
       expect(order.bracket).to.equal(EMPTY);
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
     });
 
     it("returns the maker bond when one was posted", async () => {
-      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { deployer, alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
       // Turn the maker bond on ($5).
       await (await otc.connect(deployer).setParams(5_000_000n, 5_000_000n, 2_000n, 600n)).wait();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       const makerBond = await otc.makerBondSize();
       const id = await otc.nextOrderId();
       await (
         await otc
           .connect(alice)
-          .createOrder(ecbtcAddr, fusdAddr, PRICE_BTC_FUSD, 0n, ...(await enc(aliceClient, mBTC, otc)), {
+          .createOrder(ecbtcAddr, cusdAddr, PRICE_BTC_CUSD, 0n, ...(await enc(aliceClient, mBTC, otc)), {
             value: makerBond,
           })
       ).wait();
@@ -2235,14 +2180,14 @@ describe("ConfidentialOTC", () => {
     });
 
     it("createOrder reverts when the maker bond is underfunded", async () => {
-      const { deployer, alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { deployer, alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
       await (await otc.connect(deployer).setParams(5_000_000n, 5_000_000n, 2_000n, 600n)).wait();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       await expect(
         otc.connect(alice).createOrder(
           ecbtcAddr,
-          fusdAddr,
-          PRICE_BTC_FUSD,
+          cusdAddr,
+          PRICE_BTC_CUSD,
           0n,
           ...(await enc(aliceClient, mBTC, otc)), // no value
         ),
@@ -2257,8 +2202,8 @@ describe("ConfidentialOTC", () => {
     });
 
     it("anyone may retire an expired order, and the escrow still returns to the maker", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
       const id = await createAndActivate(
@@ -2266,8 +2211,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         now + 1_000n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2288,7 +2233,7 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.closed).to.equal(true);
       expect(order.active).to.equal(false);
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
     });
 
     it("a cancelled order cannot be filled", async () => {
@@ -2301,17 +2246,17 @@ describe("ConfidentialOTC", () => {
     });
 
     it("a depositor can still recover a fill bond after the order is cancelled", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, 2n * mBTC, otc)),
       );
@@ -2336,41 +2281,41 @@ describe("ConfidentialOTC", () => {
 
   describe("views", () => {
     it("indexes orders directionally and hydrates them in a batch", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
-      await fundMaker(alice, ecbtc, ONE, fusd, 200n * ONE, otcAddr);
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
+      await fundMaker(alice, ecbtc, ONE, cusd, 200n * ONE, otcAddr);
 
-      // Sell side: ecBTC → fUSD (1 mBTC = $65 NANO).
+      // Sell side: ecBTC → cUSD (1 mBTC = $65 NANO).
       const sell = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
-      // Buy side: fUSD → ecBTC ($200 SMALL).
+      // Buy side: cUSD → ecBTC ($200 SMALL).
       const buy = await createAndActivate(
         otc,
         alice,
         aliceClient,
-        fusdAddr,
+        cusdAddr,
         ecbtcAddr,
-        PRICE_FUSD_BTC,
+        PRICE_CUSD_BTC,
         0n,
         ...(await enc(aliceClient, 200n * ONE, otc)),
       );
 
-      const sellSide = await otc.getOrdersByPair(ecbtcAddr, fusdAddr);
-      const buySide = await otc.getOrdersByPair(fusdAddr, ecbtcAddr);
+      const sellSide = await otc.getOrdersByPair(ecbtcAddr, cusdAddr);
+      const buySide = await otc.getOrdersByPair(cusdAddr, ecbtcAddr);
       expect(sellSide.map(x => x)).to.deep.equal([sell]);
       expect(buySide.map(x => x)).to.deep.equal([buy]);
 
       const batch = await otc.getOrdersBatch([sell, buy]);
       expect(batch.length).to.equal(2);
       expect(batch[0].inputToken).to.equal(ecbtcAddr);
-      expect(batch[1].inputToken).to.equal(fusdAddr);
+      expect(batch[1].inputToken).to.equal(cusdAddr);
       expect(batch[0].active).to.equal(true);
       expect(batch[0].bracket).to.equal(NANO);
       expect(batch[1].bracket).to.equal(SMALL);
@@ -2386,11 +2331,11 @@ describe("ConfidentialOTC", () => {
 
   describe("expiry", () => {
     it("rejects fills after the expiry timestamp but allows them before", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
       const expiry = now + 1_000n;
@@ -2399,8 +2344,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         expiry,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2408,7 +2353,7 @@ describe("ConfidentialOTC", () => {
       // Before expiry: fill 200 raw ecBTC (cost $13).
       await fillAndPublish(otc, bob, bobClient, id, 200n);
       await expectBalance(ecbtc, bob.address, 200n);
-      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_200RAW_FUSD);
+      await expectBalance(cusd, bob.address, 1_000n * ONE - FILL_200RAW_CUSD);
 
       // Jump past expiry.
       await hre.network.provider.send("evm_increaseTime", [2_000]);
@@ -2427,9 +2372,9 @@ describe("ConfidentialOTC", () => {
     });
 
     it("rejects top-ups after the expiry timestamp but allows them before", async () => {
-      const { alice, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
 
       const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
       const id = await createAndActivate(
@@ -2437,8 +2382,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         now + 1_000n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2460,11 +2405,11 @@ describe("ConfidentialOTC", () => {
     });
 
     it("delists on the next publish once expired, instead of staying listed", async () => {
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = await setup();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
       const id = await createAndActivate(
@@ -2472,8 +2417,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         now + 1_000n,
         ...(await enc(aliceClient, 2n * mBTC, otc)),
       );
@@ -2494,7 +2439,7 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.active).to.equal(false);
       expect(order.closed).to.equal(false); // dormant, not destroyed — escrow retained
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
       await expectBalance(ecbtc, otcAddr, 2n * mBTC - 200n);
     });
   });
@@ -2566,19 +2511,19 @@ describe("ConfidentialOTC", () => {
 
     it("keeps fills working through a fully stale oracle", async () => {
       const ctx = await setup();
-      const { alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2593,8 +2538,8 @@ describe("ConfidentialOTC", () => {
         otc,
         alice,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2746,22 +2691,22 @@ describe("ConfidentialOTC", () => {
 
     it("prices a real fill bond off the feed end to end", async () => {
       const ctx = await setup();
-      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { deployer, alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
       const feed = await deployFeed();
       await (await otc.connect(deployer).setEthUsdFeed(await feed.getAddress())).wait();
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2774,11 +2719,11 @@ describe("ConfidentialOTC", () => {
 
     it("flags stale token prices as advisory only — fills still work", async () => {
       const ctx = await setup();
-      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { deployer, alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       await advance(TWO_DAYS + 1);
       expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
@@ -2794,8 +2739,8 @@ describe("ConfidentialOTC", () => {
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2803,12 +2748,12 @@ describe("ConfidentialOTC", () => {
       await expectBalance(ecbtc, bob.address, mBTC);
     });
 
-    it("never reports fUSD as stale — it is the pinned unit of account", async () => {
-      const { otc, fusdAddr, ecbtcAddr } = await setup();
+    it("ages a $1 stablecoin's price like any other token's", async () => {
+      const { otc, cusdAddr, ecbtcAddr } = await setup();
 
       await advance(TWO_DAYS * 5);
 
-      expect(await otc.isPriceStale(fusdAddr)).to.equal(false);
+      expect(await otc.isPriceStale(cusdAddr)).to.equal(true);
       expect(await otc.isPriceStale(ecbtcAddr)).to.equal(true);
     });
 
@@ -2838,26 +2783,26 @@ describe("ConfidentialOTC", () => {
     /// headroom for the ceil-rounding add in _swap.
     const fillCap = (price: bigint, shift: bigint) => (MAXU64 - ((1n << shift) - 1n)) / price;
 
-    /// Maker alice posts 1 mBTC of ecBTC for fUSD; bob funded to take it.
+    /// Maker alice posts 1 mBTC of ecBTC for cUSD; bob funded to take it.
     async function withOrder(feeQ20: bigint) {
       const ctx = await setup();
-      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { deployer, alice, bob, ecbtc, cusd, otc, aliceClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
       if (feeQ20 > 0n) {
         await (await otc.connect(deployer).setSwapFee(feeQ20)).wait();
       }
 
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
-      await (await fusd.mint(bob.address, 1_000n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
+      await (await cusd.mint(bob.address, 1_000n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2865,7 +2810,7 @@ describe("ConfidentialOTC", () => {
     }
 
     it("is disabled at deploy and leaves the fill path byte-for-byte unchanged", async () => {
-      const { deployer, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
+      const { deployer, bob, ecbtc, cusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(0n);
 
       expect(await otc.swapFeeQ20()).to.equal(0n);
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
@@ -2875,14 +2820,14 @@ describe("ConfidentialOTC", () => {
       // Identical to the zero-fee expectations in the fillOrder suite.
       await expectBalance(ecbtc, bob.address, mBTC);
       await expectBalance(ecbtc, otcAddr, 0n);
-      await expectBalance(fusd, bob.address, 1_000n * ONE - FILL_1MBTC_FUSD);
+      await expectBalance(cusd, bob.address, 1_000n * ONE - FILL_1MBTC_CUSD);
       // The feeQ20 == 0 fast path returns before touching _feesAccrued, so the
       // slot is still the null handle and the sweep guard still fires.
       await expect(otc.connect(deployer).sweepFees(ecbtcAddr)).to.be.revertedWithCustomError(otc, "NoFeesAccrued");
     });
 
     it("skims the fee from the taker and retains it in escrow", async () => {
-      const { alice, bob, ecbtc, fusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
+      const { alice, bob, ecbtc, cusd, otc, bobClient, otcAddr, ecbtcAddr, id } = await withOrder(FEE_030);
 
       const fee = feeOf(mBTC, FEE_030); // 1_000 raw @ 0.30% → 3 raw
       expect(fee).to.equal(3n);
@@ -2891,11 +2836,11 @@ describe("ConfidentialOTC", () => {
 
       await expectBalance(ecbtc, bob.address, mBTC - fee); // taker short by the fee
       await expectBalance(ecbtc, otcAddr, fee); // fee stays put — no extra transfer
-      await expectBalance(fusd, alice.address, FILL_1MBTC_FUSD); // maker paid in full
+      await expectBalance(cusd, alice.address, FILL_1MBTC_CUSD); // maker paid in full
     });
 
     it("decrements eRemaining by the full release, so the bracket is unaffected", async () => {
-      const { bob, otc, bobClient, ecbtcAddr, fusdAddr, id } = await withOrder(FEE_030);
+      const { bob, otc, bobClient, ecbtcAddr, cusdAddr, id } = await withOrder(FEE_030);
 
       // Order is fully consumed even though the taker received less than the
       // release: eRemaining moves by eRelease, not eToTaker.
@@ -2905,7 +2850,7 @@ describe("ConfidentialOTC", () => {
       const order = await otc.getOrder(id);
       expect(order.bracket).to.equal(EMPTY);
       expect(order.active).to.equal(false);
-      expect((await otc.getOrdersByPair(ecbtcAddr, fusdAddr)).length).to.equal(0);
+      expect((await otc.getOrdersByPair(ecbtcAddr, cusdAddr)).length).to.equal(0);
     });
 
     it("accrues across multiple fills", async () => {
@@ -2926,21 +2871,21 @@ describe("ConfidentialOTC", () => {
 
     it("charges nothing when the taker fails to pay in full", async () => {
       const ctx = await setup();
-      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { deployer, alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
       await (await otc.connect(deployer).setSwapFee(FEE_030)).wait();
-      await fundMaker(alice, ecbtc, ONE, fusd, 0n, otcAddr);
+      await fundMaker(alice, ecbtc, ONE, cusd, 0n, otcAddr);
       // Bob cannot cover $65 — the release is 0, so the fee must also be 0.
-      await (await fusd.mint(bob.address, 1n * ONE)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await (await cusd.mint(bob.address, 1n * ONE)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
-        PRICE_BTC_FUSD,
+        cusdAddr,
+        PRICE_BTC_CUSD,
         0n,
         ...(await enc(aliceClient, mBTC, otc)),
       );
@@ -2956,13 +2901,13 @@ describe("ConfidentialOTC", () => {
       // 9.2e16 × MAX_FEE wraps uint64. A fee cap would cut each fill to 1.76e15
       // raw (0.019 raw output) while still charging a whole raw unit, so the
       // order is refused up front — at the maximum fee, not the live one.
-      const { alice, otc, aliceClient, fusdAddr, ecbtcAddr } = await setup();
+      const { alice, otc, aliceClient, cusdAddr, ecbtcAddr } = await setup();
       expect(await otc.swapFeeQ20()).to.equal(0n);
 
       for (const priceX64 of [200n, 10_484n]) {
         // 10,484 → 5,242 / 2^63: one mantissa step below the lowest accepted rate.
         await expect(
-          otc.connect(alice).createOrder(ecbtcAddr, fusdAddr, priceX64, 0n, ...(await enc(aliceClient, mBTC, otc))),
+          otc.connect(alice).createOrder(ecbtcAddr, cusdAddr, priceX64, 0n, ...(await enc(aliceClient, mBTC, otc))),
         ).to.be.revertedWithCustomError(otc, "PriceTooLow");
       }
     });
@@ -2972,7 +2917,7 @@ describe("ConfidentialOTC", () => {
       // price cap (1.759e15) still fits the fee bound: cap × MAX_FEE ≤ 2^64 − 1,
       // and a full fill at the cap outputs just under one raw unit.
       const ctx = await setup();
-      const { deployer, alice, bob, ecbtc, fusd, otc, aliceClient, bobClient, otcAddr, fusdAddr, ecbtcAddr } = ctx;
+      const { deployer, alice, bob, ecbtc, cusd, otc, aliceClient, bobClient, otcAddr, cusdAddr, ecbtcAddr } = ctx;
 
       const [price, shift] = [5_243n, 63n];
       await (await otc.connect(deployer).setSwapFee(MAX_FEE)).wait();
@@ -2984,15 +2929,15 @@ describe("ConfidentialOTC", () => {
 
       await (await ecbtc.mint(alice.address, deposit)).wait();
       await (await ecbtc.connect(alice).setOperator(otcAddr, FAR_FUTURE)).wait();
-      await (await fusd.mint(bob.address, output)).wait();
-      await (await fusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
+      await (await cusd.mint(bob.address, output)).wait();
+      await (await cusd.connect(bob).setOperator(otcAddr, FAR_FUTURE)).wait();
 
       const id = await createAndActivate(
         otc,
         alice,
         aliceClient,
         ecbtcAddr,
-        fusdAddr,
+        cusdAddr,
         10_485n, // priceX64 → 5,243 / 2^63
         0n,
         ...(await enc(aliceClient, deposit, otc)),

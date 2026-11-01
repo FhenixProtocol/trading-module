@@ -137,7 +137,7 @@ Grouped by role; each maps directly to contract behavior.
 | Term               | Meaning                                                                                                                                           |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Bracket**        | Coarse size tier (0–5) of the order's remaining USD-equivalent value. `255` = unpublished.                                                        |
-| **fUSD**           | The confidential stablecoin; the bracket unit of account (oracle price fixed at $1).                                                              |
+| **USD**            | The bracket and bond unit of account: an abstract 6-decimal unit, not a token. Every whitelisted token, stablecoins included, is oracle-priced in it. |
 | **Q44.20**         | Fixed-point format: value × `2^20`. Used for oracle prices and the fee.                                                                            |
 | **seq**            | Monotonic per-order sequence number; one per state-changing action (create/fill/top-up).                                                          |
 | **Publish record** | An immutable bracket snapshot for a given `seq`, plus its bond metadata.                                                                          |
@@ -269,13 +269,13 @@ priceShift`, rounded up.
 
 | Rate (6-decimal legs)         | `priceX64`           | stored          |
 | ----------------------------- | -------------------- | --------------- |
-| sell cBTC for fUSD at $84,000 | `84_000 << 64`       | `84_000 / 2^0`  |
-| buy cBTC with fUSD at $84,000 | `(1 << 64) / 84_000` | `51_131 / 2^32` |
+| sell cBTC for cUSD at $84,000 | `84_000 << 64`       | `84_000 / 2^0`  |
+| buy cBTC with cUSD at $84,000 | `(1 << 64) / 84_000` | `51_131 / 2^32` |
 | $1.00                         | `1 << 64`            | `32_768 / 2^15` |
 
 Per-fill input is capped (`_fillCap`) so `eActual × price` never wraps. The cap
 counts **raw input units**: under 2^49 whenever `priceShift > 0`. That is ~$281M
-of fUSD per fill, but only a few $k of a $0.00001 token, so cheap inputs fill in
+of a $1 token per fill, but only a few $k of a $0.00001 token, so cheap inputs fill in
 many pieces. Total order size across fills is unbounded.
 
 `createOrder` reverts `PriceTooLow` for a rate so small (below 5,243 / 2^63 ≈
@@ -296,9 +296,10 @@ at the maximum fee, so raising the fee never changes an existing order's cap.
 | WHALE       | 5     | ≥ $100,000                       |
 | UNPUBLISHED | 255   | sentinel before first reveal     |
 
-The USD-equivalent (`_toUSD`) is derived in priority order: (1) `inputToken ==
-fUSD` → identity; (2) `outputToken == fUSD` → maker's order price; (3) `cANY<>cANY`
-→ the inputToken oracle price.
+The USD-equivalent is always derived from the **input token's oracle price**,
+never the maker's order price. Each USD bracket boundary is translated into the
+token's raw units whenever its price is pushed, so the encrypted side is a plain
+comparison.
 
 ---
 
@@ -306,9 +307,10 @@ fUSD` → identity; (2) `outputToken == fUSD` → maker's order price; (3) `cANY
 
 - Only whitelisted tokens trade. Each carries a Q44.20 `oraclePrice` used **only**
   for bracket computation (never for fill math, which uses the order `price`).
-- fUSD is auto-whitelisted at `Q_DENOM` ($1). Tokens are capped at 6 decimals
-  (fUSD must be exactly 6); higher-decimal tokens can't be priced precisely in
-  Q44.20.
+- No token is auto-whitelisted and none is pinned at $1. A stablecoin is
+  whitelisted at `Q_DENOM` ($1) like any other token, and its price ages (see
+  `isPriceStale`) unless the oracle keeps pushing it. Tokens are capped at 6
+  decimals; higher-decimal tokens can't be priced precisely in Q44.20.
 - `ethOraclePrice` (Q44.20 USD/ETH) sizes ETH bonds.
 - See [`ORACLE.md`](./ORACLE.md) for the full model and `MIN_ORACLE_PRICE`.
 
@@ -341,7 +343,7 @@ CoFHE FHERC20 uses time-bound operators (not allowances). Before interacting:
 Discovery / supporting reads:
 
 - `getOrdersByPair(input, output)` → active ids for a **directional** pair
-  (`(TOKEN, fUSD)` = sell side; reverse for buy side).
+  (`(A, B)` = orders selling A for B; reverse for the other side).
 - `getMakerOrderIds(maker)`, `getTakerFills(taker)`.
 - `getPublish(orderId, seq)` → `(handle, depositor, bondWei, deadline, settled)`
   to know what to publish and whether a bond is recoverable.
@@ -398,7 +400,7 @@ publishedSeq`; listing changes only on the frontier.
 
 ### Trust assumptions / threat model
 
-- The non-fUSD leg is **arbitrary and maker-chosen**; the owner whitelist is the
+- Both legs are **arbitrary and maker-chosen**; the owner whitelist is the
   curation gate. A taker granting operator rights on a maker-controlled token is
   exposed to that token's behavior — verify addresses.
 - Bracket plaintext correctness relies on the **CoFHE threshold network**
@@ -412,8 +414,9 @@ publishedSeq`; listing changes only on the frontier.
 
 - Deploy via the shared `@launch-platform/contracts-hardhat` package (not
   `npx hardhat`, which pulls Hardhat 3). `viaIR` is enabled.
-- **Constructor:** `fUSD` only. Post-deploy the owner must:
-    1. `whitelistToken` each tradable token with a sane Q44.20 price.
+- **Constructor:** `treasury` only. Post-deploy the owner must:
+    1. `whitelistToken` each tradable token, including any stablecoin, with a
+       sane Q44.20 price.
     2. `setEthOraclePrice` (required before any bonded fill).
     3. `setOracle` (optional) to delegate ongoing price updates.
     4. `setParams` to opt into a maker bond, retune the fill bond, etc.
@@ -428,7 +431,7 @@ publishedSeq`; listing changes only on the frontier.
   public, so the frontend filters them trivially). No permissionless expiry
   eviction.
 - **Per-fill size ceiling** of ~2^48 raw input units (64-bit multiply with a
-  16-bit mantissa). Fine for fUSD (~$281M) and BTC, but a trade in a very cheap
+  16-bit mantissa). Fine for a $1 token (~$281M) and BTC, but a trade in a very cheap
   input token (e.g. $0.00001) is capped at a few $k per fill and must be split,
   each fill paying its own gas and bond.
 - **Clamped fills can overpay by one raw output unit.** A fill request above the

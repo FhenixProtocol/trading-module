@@ -100,20 +100,21 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 /// ──────────────────────────────────────────────────────────────────────────
 ///
 /// Only whitelisted tokens may be traded. Each whitelisted token carries a
-/// Q44.20 oracle price (fUSD per whole token, scaled by 2^20) used solely for
+/// Q44.20 oracle price (USD per whole token, scaled by 2^20) used solely for
 /// bracket computation — it does not affect fill math, which uses the
 /// maker-specified order price exclusively.
 ///
-/// Bracket notional is `raw input units × price >> 20`, in raw 6-decimal fUSD
+/// Bracket notional is `raw input units × price >> 20`, in raw 6-decimal USD
 /// units. Because the oracle price is per WHOLE token, that product is only in
-/// fUSD units when the input token itself has 6 decimals; a coarser ledger
+/// USD units when the input token itself has 6 decimals; a coarser ledger
 /// needs ×10^(6 − decimals). Rather than doing that multiplication under FHE on
 /// every action, each USD bracket boundary is translated once into the token's
 /// own raw units (see `_storeTokenConfig`) whenever its price is pushed, and the
 /// encrypted amount is compared against those directly.
 ///
-/// fUSD is auto-whitelisted in the constructor at oraclePrice = Q_DENOM ($1).
-/// Additional tokens are whitelisted by the owner via `whitelistToken`. Oracle
+/// USD is an abstract 6-decimal unit of account, not a token: no asset is
+/// pinned at $1, and a stablecoin is whitelisted and priced like any other
+/// token. Tokens are whitelisted by the owner via `whitelistToken`. Oracle
 /// prices (including the ETH price used for bonds) are updated by the
 /// designated `oracle` address (or the owner).
 ///
@@ -146,16 +147,15 @@ import { AggregatorV3Interface } from '../interfaces/AggregatorV3Interface.sol';
 ///                   quotes to ~0.2 bp for any rate ≥ 2^-48; below that the
 ///                   shift clamps at 63 and rounding is one Q64.64 step.
 ///                   Examples with 6-decimal legs:
-///                     sell cBTC for fUSD at $84,000 → 84_000 << 64       → 84_000 / 2^0
-///                     buy cBTC with fUSD at $84,000 → (1 << 64) / 84_000 → 51_131 / 2^32
+///                     sell cBTC for cUSD at $84,000 → 84_000 << 64       → 84_000 / 2^0
+///                     buy cBTC with cUSD at $84,000 → (1 << 64) / 84_000 → 51_131 / 2^32
 ///                     $1.00                         → 1 << 64            → 32_768 / 2^15
 ///   - expiry      : unix timestamp after which the order can no longer be
 ///                   filled. 0 = good-til-cancelled (never expires).
 ///   - encAmount   : encrypted input token quantity handle, with its `inputProof`
 ///                   batch signature bound to this contract.
 ///
-/// All tokens are capped at 6 decimals (enforced at whitelist time); fUSD
-/// must use exactly 6 decimals (enforced in the constructor). The decimals
+/// All tokens are capped at 6 decimals (enforced at whitelist time). The decimals
 /// that matter are those of the CONFIDENTIAL ledger — the only ledger this
 /// venue ever moves — so dual-ledger tokens (e.g. FUSDJmi, FhenixToken) are
 /// checked via `confidentialDecimals()` rather than the public `decimals()`.
@@ -254,9 +254,9 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      shift clamps at 63 and rounding is one Q64.64 step.
     uint8 public constant PRICE_BITS = 16;
 
-    /// @dev fUSD's confidential ledger must use exactly this many decimals —
-    ///      the bracket thresholds below are denominated in 6-decimal fUSD units.
-    uint8 public constant FUSD_DECIMALS = 6;
+    /// @dev Decimals of the USD unit of account. The bracket thresholds and
+    ///      bond sizes are denominated in 6-decimal USD units.
+    uint8 public constant USD_DECIMALS = 6;
 
     /// @dev Any whitelisted token's confidential ledger may use at most this
     ///      many decimals. Tokens with more than 6 decimals cannot be priced
@@ -318,7 +318,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     euint8 private immutable _E_BRACKET_LARGE;
     euint8 private immutable _E_BRACKET_WHALE;
 
-    /// @dev Bracket upper bounds in raw fUSD units (6 decimals). Translated into
+    /// @dev Bracket upper bounds in raw USD units (6 decimals). Translated into
     ///      each token's own raw units by {_storeTokenConfig}; never compared
     ///      against directly.
     uint64 internal constant NANO_MAX_USD = 100_000_000; // $100
@@ -361,7 +361,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
         uint64 priceUpdatedAt;
         /// @dev Confidential-ledger decimals, captured at whitelist time.
         uint8 decimals;
-        /// @dev Raw amounts below this are worth < 1 raw fUSD unit → EMPTY.
+        /// @dev Raw amounts below this are worth < 1 raw USD unit → EMPTY.
         euint64 tEmpty;
         /// @dev Raw amounts below this are worth < $100 → NANO.
         euint64 tNano;
@@ -468,9 +468,6 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     // ─────────────────────────────────────────────────────────────────────────
     // State
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// @notice The fUSD (confidential stablecoin) — the bracket unit of account.
-    IFHERC20 public immutable fUSD;
 
     struct Order {
         /// @dev Order creator; address(0) means the order does not exist.
@@ -737,7 +734,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice The rate is so low that, at MAX_SWAP_FEE_Q20, a fill would be
     ///         capped below one raw output unit but still pay a whole one.
     error PriceTooLow();
-    /// @notice A token's confidential-ledger decimals are incompatible (fUSD != 6, or token > 6).
+    /// @notice A token's confidential-ledger decimals are incompatible (token > 6).
     error InvalidDecimals();
     /// @notice The supplied expiry is already in the past.
     error InvalidExpiry();
@@ -788,26 +785,17 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deploy the OTC, anchoring it to the fUSD unit of account.
-    /// @dev    Validates fUSD's confidential-ledger decimals (see {_confidentialDecimals}),
-    ///         auto-whitelists it at $1.00 (Q_DENOM), and precomputes the reusable
-    ///         encrypted bracket constants/thresholds (persisting their ACL so they
-    ///         remain valid operands in later txns). The deployer becomes the owner.
-    ///         `ethOraclePrice` starts unset and must be configured via
-    ///         {setEthOraclePrice} before any bonded action.
-    /// @param  fUSD_     The confidential stablecoin used as the bracket unit of account.
+    /// @notice Deploy the OTC with an empty whitelist.
+    /// @dev    Precomputes the reusable encrypted bracket constants (persisting
+    ///         their ACL so they remain valid operands in later txns). The deployer
+    ///         becomes the owner. Tokens, including any stablecoin, are added
+    ///         afterwards via {whitelistToken}. `ethOraclePrice` starts unset and
+    ///         must be configured via {setEthOraclePrice} before any bonded action.
     /// @param  treasury_ Destination for {sweepFees} sweeps. Taken explicitly rather than
     ///                   defaulted to the deployer, so fee custody is a deliberate deployment
     ///                   choice and never silently lands on a hot deployer key.
-    constructor(IFHERC20 fUSD_, address treasury_) Ownable(msg.sender) {
-        if (address(fUSD_) == address(0)) revert ZeroAddress();
+    constructor(address treasury_) Ownable(msg.sender) {
         if (treasury_ == address(0)) revert ZeroAddress();
-        if (_confidentialDecimals(address(fUSD_)) != FUSD_DECIMALS) revert InvalidDecimals();
-        fUSD = fUSD_;
-
-        // Auto-whitelist fUSD at $1.00 in Q44.20 (= Q_DENOM).
-        // fUSD is the bracket unit of account, so its oracle price is always 1.
-        _storeTokenConfig(address(fUSD_), Q_DENOM, FUSD_DECIMALS);
 
         _E_BRACKET_EMPTY = FHE.asEuint8(BRACKET_EMPTY);
         _E_BRACKET_NANO = FHE.asEuint8(BRACKET_NANO);
@@ -876,7 +864,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @param price    Its Q44.20 oracle price.
     /// @param decimals Its confidential-ledger decimals (≤ MAX_TOKEN_DECIMALS).
     function _storeTokenConfig(address token, uint64 price, uint8 decimals) internal {
-        uint256 convPrice = uint256(price) * 10 ** (FUSD_DECIMALS - decimals);
+        uint256 convPrice = uint256(price) * 10 ** (USD_DECIMALS - decimals);
         _tokenConfig[token] = TokenConfig({
             whitelisted: true,
             oraclePrice: price,
@@ -892,7 +880,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
 
     /// @dev `ceil(usdMax × 2^20 / convPrice)`, trivially encrypted and ACL'd for
     ///      reuse as a comparison operand in later transactions.
-    /// @param usdMax    A bracket upper bound in raw fUSD units.
+    /// @param usdMax    A bracket upper bound in raw USD units.
     /// @param convPrice The token's Q44.20 price rescaled to its decimals.
     /// @return The bound in the token's raw units, as a persistent euint64.
     function _threshold(uint256 usdMax, uint256 convPrice) internal returns (euint64) {
@@ -1224,12 +1212,10 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     /// @notice Whether a whitelisted token's bracket price has gone stale.
     /// @dev    Advisory only — {_computeBracket} never reverts on this. Brackets are
     ///         coarse buckets, so a slightly old price mis-sorts the book at
-    ///         worst;
-    ///         fUSD is never stale: it is the unit of account, pinned at $1.
+    ///         worst. Stablecoins are not exempt: their price ages like any other.
     /// @param  token The token to check.
     /// @return True when the price is older than {maxPriceAge}.
     function isPriceStale(address token) external view returns (bool) {
-        if (token == address(fUSD)) return false;
         return _isStale(_tokenConfig[token].priceUpdatedAt);
     }
 
@@ -1672,7 +1658,7 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     ///      {createOrder} keeps it within the {_takeFee} bound too.
     ///
     ///      It counts raw INPUT units: under 2^49 whenever shift > 0, which is
-    ///      ~$281M of fUSD but only a few $k of a $0.00001 token, so cheap
+    ///      ~$281M of a $1 token but only a few $k of a $0.00001 token, so cheap
     ///      inputs fill in many pieces. At shift 63 a fill at the cap outputs
     ///      just under one raw unit.
     /// @param  price The order's price mantissa.
@@ -1919,8 +1905,8 @@ contract ConfidentialOTC is Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @notice Active order ids for a directional pair (inputToken → outputToken).
-    /// @dev    Directional: getOrdersByPair(TOKEN, fUSD) returns orders selling
-    ///         TOKEN for fUSD; pass the legs reversed for the opposite side.
+    /// @dev    Directional: getOrdersByPair(A, B) returns orders selling
+    ///         A for B; pass the legs reversed for the opposite side.
     /// @param  inputToken  The escrowed leg to match on.
     /// @param  outputToken The requested leg to match on.
     /// @return The active order ids listed for that directional pair.
